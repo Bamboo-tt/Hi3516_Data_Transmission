@@ -1,0 +1,10 @@
+include ../../Makefile.param
+
+COMMON_DIR:=$(PWD)/../../../common
+include $(PWD)/../../../Makefile.param
+
+OPTEE_DIR:=$(OPEN_SOURCE_PATH)/optee
+MPI_LIBS += $(OPTEE_DIR)/$(OPTEE_CLIENT_VER)/out/libteec/libteec.a
+CFLAGS += -I$(PWD)/../../../common
+CFLAGS += -fstack-protector-strong
+

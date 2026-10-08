@@ -1,0 +1,3567 @@
+#if 1
+/*****************************copy from sample_comm_venc.c*****************************************/
+/*
+  Copyright (c), 2001-2024, Shenshu Tech. Co., Ltd.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <poll.h>
+#include <sys/time.h>
+#include <sys/select.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <pthread.h>
+#include <math.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <limits.h>
+
+#include "sample_comm.h"
+
+#define TEMP_BUF_LEN            8
+#define MAX_THM_SIZE            (64 * 1024)
+#define QPMAP_BUF_NUM           8
+#define VENC_QPMAP_MAX_CHN      2
+#define VENC_MOSAIC_MAP_MAX_CHN  2
+#define SEND_FRAME_BUF_NUM      8
+#define VENC_PATH_MAX           1024
+
+#define SAMPLE_RETURN_CONTINUE  1
+#define SAMPLE_RETURN_BREAK     2
+#define SAMPLE_RETURN_NULL      3
+#define SAMPLE_RETURN_GOTO      4
+#define SAMPLE_RETURN_FAILURE   (-1)
+#define MAX_MMZ_NAME_LEN        32
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+#include "RtpSendPs.h"
+char* buf;
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+typedef struct {
+    td_u32 qpmap_size[VENC_QPMAP_MAX_CHN];
+    td_phys_addr_t qpmap_phys_addr[VENC_QPMAP_MAX_CHN][QPMAP_BUF_NUM];
+    td_void *qpmap_vir_addr[VENC_QPMAP_MAX_CHN][QPMAP_BUF_NUM];
+
+    td_u32 skip_weight_size[VENC_QPMAP_MAX_CHN];
+    td_phys_addr_t skip_weight_phys_addr[VENC_QPMAP_MAX_CHN][QPMAP_BUF_NUM];
+    td_void *skip_weight_vir_addr[VENC_QPMAP_MAX_CHN][QPMAP_BUF_NUM];
+} sample_easyvenc_comm_venc_frame_proc_info;
+
+typedef struct {
+    td_phys_addr_t map_phys_addr[VENC_MOSAIC_MAP_MAX_CHN];
+    td_void *map_vir_addr[VENC_MOSAIC_MAP_MAX_CHN];
+    ot_mosaic_blk_size blk_size[VENC_MOSAIC_MAP_MAX_CHN];
+} sample_easyvenc_comm_venc_mosaic_frame_proc_info;
+
+typedef struct {
+    FILE *file[OT_VENC_MAX_CHN_NUM];
+    td_s32 venc_fd[OT_VENC_MAX_CHN_NUM];
+    td_s32 maxfd;
+    td_u32 picture_cnt[OT_VENC_MAX_CHN_NUM];
+    td_char file_name[OT_VENC_MAX_CHN_NUM][FILE_NAME_LEN];
+    td_char real_file_name[OT_VENC_MAX_CHN_NUM][VENC_PATH_MAX];
+    ot_venc_chn venc_chn;
+    td_char file_postfix[10]; /* 10 :file_postfix number */
+    td_s32 chn_total;
+} sample_comm_venc_stream_proc_info;
+
+typedef struct {
+    td_bool thread_start;
+    ot_vpss_grp vpss_grp;
+    ot_venc_chn venc_chn[OT_VENC_MAX_CHN_NUM];
+    ot_vpss_chn vpss_chn[OT_VPSS_MAX_PHYS_CHN_NUM];
+    ot_size size[OT_VENC_MAX_CHN_NUM];
+    td_u32 cnt;
+} sample_venc_send_frame_para;
+
+
+
+static pthread_t g_venc_pid;
+static pthread_t g_venc_qpmap_pid;
+static sample_venc_getstream_para g_para = {
+    .thread_start = TD_FALSE,
+    .cnt = 0
+};
+
+static sample_venc_qpmap_sendframe_para g_qpmap_send_frame_para;
+
+
+td_s32 g_easyvenc_snap_cnt = 0;
+td_char *g_easyvenc_dst_buf = TD_NULL;
+
+#ifdef __READ_ALL_FILE__
+static td_s32 read_jpg_file_pos(FILE *fp_jpg, td_char *psz_file, td_s32 size, td_s32 *startpos, td_s32 *endpos)
+{
+    td_s32 i = 0;
+    td_s32 bufpos = 0;
+    td_s32 tempbuf[TEMP_BUF_LEN] = { 0 };
+    td_s32 startflag[2] = { 0xff, 0xd8 }; /* 2 is array size */
+    td_s32 endflag[2] = { 0xff, 0xd9 };   /* 2 is array size */
+
+    if (fread(psz_file, size, 1, fp_jpg) == 0) {
+        (td_void)fclose(fp_jpg);
+        printf("fread jpeg src fail!\n");
+        return TD_FAILURE;
+    }
+
+    (td_void)fclose(fp_jpg);
+    td_u16 thm_len;
+    thm_len = (psz_file[0x4] << 0x8) + psz_file[0x5];
+    while (i < size) {
+        tempbuf[bufpos] = psz_file[i++];
+
+        if (bufpos > 0 && memcmp(tempbuf + bufpos - 1, startflag, sizeof(startflag)) == 0) {
+            *startpos = i - 0x2;
+            if (*startpos < 0) {
+                *startpos = 0;
+            }
+        }
+
+        if (bufpos > 0 && memcmp(tempbuf + bufpos - 1, endflag, sizeof(endflag)) == 0) {
+            *endpos = i;
+            break;
+        }
+
+        bufpos++;
+
+        if (bufpos == (TEMP_BUF_LEN - 1)) {
+            if (tempbuf[bufpos - 1] != 0xFF) {
+                bufpos = 0;
+            }
+        } else if (bufpos > (TEMP_BUF_LEN - 1)) {
+            bufpos = 0;
+        }
+    }
+
+    if (*endpos - *startpos <= 0) {
+        printf("get .thm 11 fail!\n");
+        return TD_FAILURE;
+    }
+
+    if (*endpos - *startpos >= size) {
+        printf("NO DCF info, get .thm 22 fail!\n");
+        return TD_FAILURE;
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_s32 cpy_jpg_file_by_pos(td_char *psz_file, td_s32 startpos, td_s32 endpos)
+{
+    td_char *temp = psz_file + startpos;
+    if (MAX_THM_SIZE < (endpos - startpos)) {
+        printf("thm is too large than MAX_THM_SIZE, get .thm 33 fail!\n");
+        return TD_FAILURE;
+    }
+
+    td_char *c_dst_buf = (td_char *)malloc(endpos - startpos);
+    if (c_dst_buf == TD_NULL) {
+        printf("memory malloc fail!\n");
+        return TD_FAILURE;
+    }
+
+    if (memcpy_s(c_dst_buf, endpos - startpos, temp, endpos - startpos) != EOK) {
+        printf("call memcpy_s error\n");
+        free(c_dst_buf);
+        return TD_FAILURE;
+    }
+
+    g_easyvenc_dst_buf = c_dst_buf;
+
+    return TD_SUCCESS;
+}
+
+static td_s32 file_trans_get_thm_from_jpg(td_char *jpg_path, td_u8 len, td_u32 *dst_size)
+{
+    td_s32 ret = TD_FAILURE;
+    FILE *fp_jpg = TD_NULL;
+    td_s32 startpos = 0;
+    td_s32 endpos = 0;
+    td_char *psz_file = TD_NULL;
+    td_s32 fd;
+    struct stat stat_info = { 0 };
+    td_char real_path[PATH_MAX];
+
+    if (realpath(jpg_path, real_path) == TD_NULL) {
+        printf("file %s error!\n", real_path);
+        return TD_FAILURE;
+    }
+
+    fp_jpg = fopen(real_path, "rb");
+    if (fp_jpg == TD_NULL) {
+        printf("file %s not exist!\n", real_path);
+        return TD_FAILURE;
+    } else {
+        fd = fileno(fp_jpg);
+        fchmod(fd, S_IRUSR | S_IWUSR);
+        fstat(fd, &stat_info);
+        psz_file = (td_char *)malloc(stat_info.size);
+        if ((psz_file == TD_NULL) || (stat_info.size < 6)) { /* 6: algo num */
+            fclose(fp_jpg);
+            printf("memory malloc fail!\n");
+            return TD_FAILURE;
+        }
+
+        ret = read_jpg_file_pos(fp_jpg, psz_file, stat_info.size, &startpos, &endpos);
+        if (ret != TD_SUCCESS) {
+            free(psz_file);
+            printf("read_jpg_file_pos fail!\n");
+            return TD_FAILURE;
+        }
+    }
+
+    ret = cpy_jpg_file_by_pos(psz_file, startpos, endpos);
+    if (ret != TD_SUCCESS) {
+        free(psz_file);
+        printf("cpy_jpg_file_by_pos fail!\n");
+        return TD_FAILURE;
+    }
+
+    *dst_size = endpos - startpos;
+    free(psz_file);
+
+    return TD_SUCCESS;
+}
+
+#else
+
+static td_void file_trans_set_tembuf(FILE *fp_jpg, struct stat *stat_info, td_s32 *startpos, td_s32 *endpos)
+{
+    td_s32 tempbuf[TEMP_BUF_LEN] = { 0 };
+    td_s32 fd, ret;
+    td_s32 bufpos = 0;
+    td_s32 startflag[2] = { 0xff, 0xd8 }; /* 2 is a number */
+    td_s32 endflag[2] = { 0xff, 0xd9 };   /* 2 is a number */
+    td_bool start_match = TD_FALSE;
+
+    fd = fileno(fp_jpg);
+    fchmod(fd, S_IRUSR | S_IWUSR);
+    fstat(fd, stat_info);
+
+    while (!feof(fp_jpg)) {
+        tempbuf[bufpos] = getc(fp_jpg);
+        if (bufpos > 0) {
+            if (memcmp(tempbuf + bufpos - 1, startflag, sizeof(startflag)) == 0) {
+                *startpos = ((ftell(fp_jpg) - 2) < 0) ? 0 : (ftell(fp_jpg) - 2); /* 2 is a number 2 is a number */
+                start_match = TD_TRUE;
+            }
+
+            ret = memcmp(tempbuf + bufpos - 1, endflag, sizeof(endflag));
+            if ((ret == 0) && (start_match == TD_TRUE)) {
+                *endpos = ftell(fp_jpg);
+                break;
+            } else if ((ret == 0) && (start_match != TD_TRUE)) {
+                *endpos = ftell(fp_jpg);
+            }
+        }
+        bufpos++;
+
+        if (bufpos == (TEMP_BUF_LEN - 1)) {
+            if (tempbuf[bufpos - 1] != 0xFF) {
+                bufpos = 0;
+            }
+        } else if (bufpos > (TEMP_BUF_LEN - 1)) {
+            if (tempbuf[bufpos - 1] == 0xFF) {
+                tempbuf[0] = 0xFF;
+                bufpos = 1;
+            } else {
+                bufpos = 0;
+            }
+        }
+    }
+}
+
+static td_s32 file_trans_get_thm_from_jpg(td_char *jpg_path, td_u8 len, td_u32 *dst_size)
+{
+    td_s32 startpos = 0;
+    td_s32 endpos = 0;
+
+    struct stat stat_info = { 0 };
+
+    FILE *fp_jpg = TD_NULL;
+    td_char real_path[PATH_MAX];
+
+    if ((len > FILE_NAME_LEN) || realpath(jpg_path, real_path) == TD_NULL) {
+        printf("file %s error!\n", jpg_path);
+        return TD_FAILURE;
+    }
+
+    fp_jpg = fopen(real_path, "rb");
+    if (fp_jpg == TD_NULL) {
+        printf("file %s not exist!\n", real_path);
+        return TD_FAILURE;
+    } else {
+        file_trans_set_tembuf(fp_jpg, &stat_info, &startpos, &endpos);
+    }
+
+    if (endpos - startpos <= 0) {
+        printf("get .thm 11 fail!\n");
+        fclose(fp_jpg);
+        return TD_FAILURE;
+    }
+
+    if (endpos - startpos > MAX_THM_SIZE) {
+        printf("thm is too large than MAX_THM_SIZE, get .thm 22 fail!\n");
+        fclose(fp_jpg);
+        return TD_FAILURE;
+    }
+
+    if (endpos - startpos >= stat_info.st_size) {
+        printf("NO DCF info, get .thm 33 fail!\n");
+        fclose(fp_jpg);
+        return TD_FAILURE;
+    }
+
+    td_char *c_dst_buf = (td_char *)malloc(endpos - startpos);
+    if (c_dst_buf == TD_NULL) {
+        printf("memory malloc fail!\n");
+        fclose(fp_jpg);
+        return TD_FAILURE;
+    }
+
+    (td_void)fseek(fp_jpg, (long)startpos, SEEK_SET);
+    *dst_size = fread(c_dst_buf, 1, endpos - startpos, fp_jpg);
+    if (*dst_size != (td_u32)(endpos - startpos)) {
+        free(c_dst_buf);
+        printf("fread fail!\n");
+        fclose(fp_jpg);
+        return TD_FAILURE;
+    }
+
+    g_easyvenc_dst_buf = c_dst_buf;
+    (td_void)fclose(fp_jpg);
+
+    return TD_SUCCESS;
+}
+#endif
+
+/* set venc memory location */
+td_s32 sample_easyvenc_comm_venc_mem_config(td_void)
+{
+    td_s32 i, ret;
+    ot_mpp_chn mpp_chn_venc;
+
+    /* group, venc max chn is 64 */
+    for (i = 0; i < 64; i++) {
+        td_char *pc_mmz_name = TD_NULL;
+        mpp_chn_venc.mod_id = OT_ID_VENC;
+        mpp_chn_venc.dev_id = 0;
+        mpp_chn_venc.chn_id = i;
+
+        /* venc */
+        ret = ss_mpi_sys_set_mem_cfg(&mpp_chn_venc, pc_mmz_name);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_sys_set_mem_config with %#x!\n", ret);
+            return TD_FAILURE;
+        }
+    }
+    return TD_SUCCESS;
+}
+
+/* get file postfix according palyload_type. */
+td_s32 sample_easyvenc_comm_venc_get_file_postfix(ot_payload_type payload, td_char *file_postfix, td_u8 len)
+{
+    if (payload == OT_PT_H264) {
+        if (strcpy_s(file_postfix, len, ".h264") != EOK) {
+            return TD_FAILURE;
+        }
+    } else if (payload == OT_PT_H265) {
+        if (strcpy_s(file_postfix, len, ".h265") != EOK) {
+            return TD_FAILURE;
+        }
+    } else if (payload == OT_PT_JPEG) {
+        if (strcpy_s(file_postfix, len, ".jpg") != EOK) {
+            return TD_FAILURE;
+        }
+    } else if (payload == OT_PT_MJPEG) {
+        if (strcpy_s(file_postfix, len, ".mjp") != EOK) {
+            return TD_FAILURE;
+        }
+    } else if (payload == OT_PT_SVAC3) {
+        if (strcpy_s(file_postfix, len, ".svac3") != EOK) {
+            return TD_FAILURE;
+        }
+    } else {
+        sample_print("payload type err!\n");
+        return TD_FAILURE;
+    }
+    return TD_SUCCESS;
+}
+
+td_s32 sample_easyvenc_comm_venc_get_gop_attr(ot_venc_gop_mode gop_mode, ot_venc_gop_attr *gop_attr)
+{
+    switch (gop_mode) {
+        case OT_VENC_GOP_MODE_NORMAL_P:
+            gop_attr->gop_mode = OT_VENC_GOP_MODE_NORMAL_P;
+            gop_attr->normal_p.ip_qp_delta = 2; /* 2 is a number */
+            break;
+
+        case OT_VENC_GOP_MODE_SMART_P:
+            gop_attr->gop_mode = OT_VENC_GOP_MODE_SMART_P;
+            gop_attr->smart_p.bg_qp_delta = 4;  /* 4 is a number */
+            gop_attr->smart_p.vi_qp_delta = 2;  /* 2 is a number */
+            gop_attr->smart_p.bg_interval = 180; /* 180 is a number */
+            break;
+
+        case OT_VENC_GOP_MODE_SMART_CRR:
+            gop_attr->gop_mode = OT_VENC_GOP_MODE_SMART_CRR;
+            gop_attr->smart_crr.bg_qp_delta = 10;   /* 10: bg_qp_delta */
+            gop_attr->smart_crr.vi_qp_delta = 3;    /* 3: vi_qp_delta */
+            gop_attr->smart_crr.bg_interval = 300;  /* 300: bg_interval */
+            gop_attr->smart_crr.crr_split_num = 4;  /* 4: crr_split_num */
+            gop_attr->smart_crr.crr_delay_num = 0;
+            gop_attr->smart_crr.strategy = 0;
+            break;
+
+        case OT_VENC_GOP_MODE_DUAL_P:
+            gop_attr->gop_mode = OT_VENC_GOP_MODE_DUAL_P;
+            gop_attr->dual_p.ip_qp_delta = 4; /* 4 is a number */
+            gop_attr->dual_p.sp_qp_delta = 2; /* 2 is a number */
+            gop_attr->dual_p.sp_interval = 3; /* 3 is a number */
+            break;
+
+        case OT_VENC_GOP_MODE_BIPRED_B:
+            gop_attr->gop_mode = OT_VENC_GOP_MODE_BIPRED_B;
+            gop_attr->bipred_b.b_qp_delta = -2; /* -2 is a number */
+            gop_attr->bipred_b.ip_qp_delta = 3; /* 3 is a number */
+            gop_attr->bipred_b.b_frame_num = 2; /* 2 is a number */
+            break;
+
+        default:
+            sample_print("not support the gop mode !\n");
+            return TD_FAILURE;
+    }
+
+    return TD_SUCCESS;
+}
+
+td_s32 sample_easyvenc_comm_venc_get_dcf_info(td_char *src_jpg_path, td_u32 src_len, td_char *dst_thm_path, td_u32 dst_len)
+{
+    td_s32 fd;
+    td_char jpg_src_path[FILE_NAME_LEN] = {0};
+    td_char jpg_des_path[FILE_NAME_LEN] = {0};
+    td_u32 dst_size = 0;
+    td_u32 rtn_val;
+    td_s32 ret;
+    if (snprintf_s(jpg_src_path, sizeof(jpg_src_path), src_len - 1, "%s", src_jpg_path) < 0) {
+        return TD_FAILURE;
+    }
+
+    if (snprintf_s(jpg_des_path, sizeof(jpg_des_path), dst_len - 1, "%s", dst_thm_path) < 0) {
+        return TD_FAILURE;
+    }
+
+    ret = file_trans_get_thm_from_jpg(jpg_src_path, FILE_NAME_LEN, &dst_size);
+    if ((ret != TD_SUCCESS) || (dst_size == 0)) {
+        printf("fail to get thm\n");
+        return TD_FAILURE;
+    }
+
+    FILE *fp_thm = fopen(jpg_des_path, "w");
+    if (fp_thm == TD_NULL) {
+        printf("file to create file %s\n", jpg_des_path);
+        return TD_FAILURE;
+    }
+
+    fd = fileno(fp_thm);
+    fchmod(fd, S_IRUSR | S_IWUSR);
+
+    td_u32 writen_size = 0;
+
+    while (writen_size < dst_size) {
+        rtn_val = fwrite(g_easyvenc_dst_buf + writen_size, 1, dst_size, fp_thm);
+        if (rtn_val <= 0) {
+            printf("fail to write file, rtn=%u\n", rtn_val);
+            break;
+        }
+
+        writen_size += rtn_val;
+    }
+
+    if (fp_thm != TD_NULL) {
+        fclose(fp_thm);
+        fp_thm = 0;
+    }
+
+    if (g_easyvenc_dst_buf != TD_NULL) {
+        free(g_easyvenc_dst_buf);
+        g_easyvenc_dst_buf = TD_NULL;
+    }
+
+    return 0;
+}
+
+td_s32 sample_easyvenc_comm_venc_save_stream(FILE *fd, ot_venc_stream *stream)
+{
+#if 0
+    td_u32 i;
+    for (i = 0; i < stream->pack_cnt; i++) {
+        (td_void)fwrite(stream->pack[i].addr + stream->pack[i].offset,
+                        stream->pack[i].len - stream->pack[i].offset, 1, fd);
+
+        (td_void)fflush(fd);
+    }
+    return TD_SUCCESS;
+#endif
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+	
+	int total_size_Frame = 0;
+    td_u32 i;
+    // char* buf = (char*)malloc(1024 * 1024);
+    //  (td_void)memset_s(buf, 1024 * 1024, 0, 1024 * 1024);//全部置零
+    for (i = 0; i < stream->pack_cnt; i++) {
+        (td_void)memcpy_s(buf + PES_HDR_LEN + total_size_Frame, \
+            1024 * 1024 - PES_HDR_LEN - total_size_Frame, \
+            stream->pack[i].addr + stream->pack[i].offset,  \
+            stream->pack[i].len - stream->pack[i].offset);
+        total_size_Frame += stream->pack[i].len - stream->pack[i].offset;
+    }
+    //  printf("AAA total_size_Frame %d \n ",total_size_Frame);
+    gb28181_streampackageForH264(buf + PES_HDR_LEN, total_size_Frame, &pPacker, 0); //0 表示传递的是视频数据
+      pPacker.s64CurPts += 3600;
+      videostreaming = TD_TRUE;
+    //  pPacker.s64CurPts = convertToRTPTimestamp();
+    // sleep(40);
+	return TD_SUCCESS;
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+
+}
+
+static td_s32 sample_easyvenc_comm_venc_phys_addr_retrace(FILE *fd, ot_venc_stream_buf_info *stream_buf, ot_venc_stream *stream,
+    td_u32 i, td_u32 j)
+{
+    td_u64 src_phys_addr;
+    td_u32 left;
+    td_u32 ret;
+
+    if (stream->pack[i].phys_addr + stream->pack[i].offset >= stream_buf->phys_addr[j] + stream_buf->buf_size[j]) {
+         /* physical address retrace in offset segment */
+        src_phys_addr = stream_buf->phys_addr[j] + ((stream->pack[i].phys_addr + stream->pack[i].offset) -
+            (stream_buf->phys_addr[j] + stream_buf->buf_size[j]));
+
+        ret = fwrite((td_void *)(td_uintptr_t)src_phys_addr, stream->pack[i].len - stream->pack[i].offset, 1, fd);
+        if (ret > 0) {
+            sample_print("fwrite err %u\n", ret);
+            return TD_FAILURE;
+        }
+    } else {
+        /* physical address retrace in data segment */
+        left = (stream_buf->phys_addr[j] + stream_buf->buf_size[j]) - stream->pack[i].phys_addr;
+
+        ret = fwrite((td_void *)(td_uintptr_t)(stream->pack[i].phys_addr + stream->pack[i].offset),
+            left - stream->pack[i].offset, 1, fd);
+        if (ret == 0) {
+            sample_print("fwrite err %u\n", ret);
+            return TD_FAILURE;
+        }
+
+        ret = fwrite((td_void *)(td_uintptr_t)stream_buf->phys_addr[j], stream->pack[i].len - left, 1, fd);
+        if (ret == 0) {
+            sample_print("fwrite err %u\n", ret);
+            return TD_FAILURE;
+        }
+    }
+
+    return TD_SUCCESS;
+}
+
+/* the process of physical address retrace */
+td_s32 sample_easyvenc_comm_venc_save_stream_phys_addr(FILE *fd, ot_venc_stream_buf_info *stream_buf, ot_venc_stream *stream)
+{
+    td_u32 i, j;
+    td_u32 ret;
+
+    for (i = 0; i < stream->pack_cnt; i++) {
+        for (j = 0; j < OT_VENC_MAX_TILE_NUM; j++) {
+            if ((stream->pack[i].phys_addr > stream_buf->phys_addr[j]) &&
+                (stream->pack[i].phys_addr <= stream_buf->phys_addr[j] + stream_buf->buf_size[j])) {
+                break;
+            }
+        }
+
+        if (j < OT_VENC_MAX_TILE_NUM &&
+            stream->pack[i].phys_addr + stream->pack[i].len >= stream_buf->phys_addr[j] + stream_buf->buf_size[j]) {
+            if (sample_easyvenc_comm_venc_phys_addr_retrace(fd, stream_buf, stream, i, j) != TD_SUCCESS) {
+                return TD_FAILURE;
+            }
+        } else {
+            /* physical address retrace does not happen */
+            ret = fwrite((td_void *)(td_uintptr_t)(stream->pack[i].phys_addr + stream->pack[i].offset),
+                stream->pack[i].len - stream->pack[i].offset, 1, fd);
+            if (ret == 0) {
+                sample_print("fwrite err %u\n", ret);
+                return TD_FAILURE;
+            }
+        }
+        (td_void)fflush(fd);
+    }
+
+    return TD_SUCCESS;
+}
+
+td_s32 sample_easyvenc_comm_venc_close_reencode(ot_venc_chn venc_chn)
+{
+    td_s32 ret;
+    ot_venc_rc_param rc_param;
+    ot_venc_chn_attr chn_attr;
+
+    ret = ss_mpi_venc_get_chn_attr(venc_chn, &chn_attr);
+    if (ret != TD_SUCCESS) {
+        sample_print("GetChnAttr failed!\n");
+        return TD_FAILURE;
+    }
+
+    ret = ss_mpi_venc_get_rc_param(venc_chn, &rc_param);
+    if (ret != TD_SUCCESS) {
+        sample_print("GetRcParam failed!\n");
+        return TD_FAILURE;
+    }
+
+    if (chn_attr.rc_attr.rc_mode == OT_VENC_RC_MODE_H264_ABR) {
+        rc_param.h264_abr_param.max_reencode_times = 0;
+    } else if (chn_attr.rc_attr.rc_mode == OT_VENC_RC_MODE_H264_CBR) {
+        rc_param.h264_cbr_param.max_reencode_times = 0;
+    } else if (chn_attr.rc_attr.rc_mode == OT_VENC_RC_MODE_H264_VBR) {
+        rc_param.h264_vbr_param.max_reencode_times = 0;
+    } else if (chn_attr.rc_attr.rc_mode == OT_VENC_RC_MODE_H265_ABR) {
+        rc_param.h265_abr_param.max_reencode_times = 0;
+    } else if (chn_attr.rc_attr.rc_mode == OT_VENC_RC_MODE_H265_CBR) {
+        rc_param.h265_cbr_param.max_reencode_times = 0;
+    } else if (chn_attr.rc_attr.rc_mode == OT_VENC_RC_MODE_H265_VBR) {
+        rc_param.h265_vbr_param.max_reencode_times = 0;
+    } else if (chn_attr.rc_attr.rc_mode == OT_VENC_RC_MODE_SVAC3_ABR) {
+        rc_param.svac3_abr_param.max_reencode_times = 0;
+    } else if (chn_attr.rc_attr.rc_mode == OT_VENC_RC_MODE_SVAC3_CBR) {
+        rc_param.svac3_cbr_param.max_reencode_times = 0;
+    } else if (chn_attr.rc_attr.rc_mode == OT_VENC_RC_MODE_SVAC3_VBR) {
+        rc_param.svac3_vbr_param.max_reencode_times = 0;
+    } else {
+        return TD_SUCCESS;
+    }
+
+    ret = ss_mpi_venc_set_rc_param(venc_chn, &rc_param);
+    if (ret != TD_SUCCESS) {
+        sample_print("SetRcParam failed!\n");
+        return TD_FAILURE;
+    }
+
+    return TD_SUCCESS;
+}
+static td_void sample_easyvenc_comm_venc_h264_qpmap_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 frame_rate,
+    td_u32 stats_time)
+{
+    ot_venc_h264_qpmap h264_qpmap;
+
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H264_QPMAP;
+    h264_qpmap.gop = gop;
+    h264_qpmap.stats_time = stats_time;
+    h264_qpmap.src_frame_rate = frame_rate;
+    h264_qpmap.dst_frame_rate = frame_rate;
+
+    venc_chn_attr->rc_attr.h264_qpmap = h264_qpmap;
+}
+
+static td_void sample_easyvenc_comm_venc_h265_qpmap_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 frame_rate,
+    td_u32 stats_time)
+{
+    ot_venc_h265_qpmap h265_qpmap;
+
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H265_QPMAP;
+    h265_qpmap.gop = gop;
+    h265_qpmap.stats_time = stats_time;
+    h265_qpmap.src_frame_rate = frame_rate;
+    h265_qpmap.dst_frame_rate = frame_rate;
+    h265_qpmap.qpmap_mode = OT_VENC_RC_QPMAP_MODE_MEAN_QP;
+    venc_chn_attr->rc_attr.h265_qpmap = h265_qpmap;
+}
+
+static td_void sample_easyvenc_comm_venc_svac3_qpmap_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 frame_rate,
+    td_u32 stats_time)
+{
+    ot_venc_svac3_qpmap svac3_qpmap;
+
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_SVAC3_QPMAP;
+    svac3_qpmap.gop = gop;
+    svac3_qpmap.stats_time = stats_time;
+    svac3_qpmap.src_frame_rate = frame_rate;
+    svac3_qpmap.dst_frame_rate = frame_rate;
+    svac3_qpmap.qpmap_mode = OT_VENC_RC_QPMAP_MODE_MEAN_QP;
+    venc_chn_attr->rc_attr.svac3_qpmap = svac3_qpmap;
+}
+
+static td_void sample_easyvenc_comm_venc_h264_qvbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_h264_qvbr h264_qvbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H264_QVBR;
+    h264_qvbr.gop = gop;
+    h264_qvbr.stats_time = stats_time;
+    h264_qvbr.src_frame_rate = frame_rate;
+    h264_qvbr.dst_frame_rate = frame_rate;
+    h264_qvbr.target_bit_rate = ((td_u64)4096 * (pic_width * pic_height)) / /* 4096: 4M */
+        (1920 * 1080); /* 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.h264_qvbr = h264_qvbr;
+}
+
+static td_void sample_easyvenc_comm_venc_h265_qvbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_h265_qvbr h265_qvbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H265_QVBR;
+    h265_qvbr.gop = gop;
+    h265_qvbr.stats_time = stats_time;
+    h265_qvbr.src_frame_rate = frame_rate;
+    h265_qvbr.dst_frame_rate = frame_rate;
+    h265_qvbr.target_bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / /* 3072: 3M */
+        (1920 * 1080); /* 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.h265_qvbr = h265_qvbr;
+}
+
+static td_void sample_easyvenc_comm_venc_svac3_qvbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_svac3_qvbr svac3_qvbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_SVAC3_QVBR;
+    svac3_qvbr.gop = gop;
+    svac3_qvbr.stats_time = stats_time;
+    svac3_qvbr.src_frame_rate = frame_rate;
+    svac3_qvbr.dst_frame_rate = frame_rate;
+    svac3_qvbr.target_bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / /* 3072: 3M */
+        (1920 * 1080); /* 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.svac3_qvbr = svac3_qvbr;
+}
+
+static td_void sample_easyvenc_comm_venc_set_h265_cvbr_bit_rate(ot_venc_chn_attr *venc_chn_attr, ot_venc_h265_cvbr *h265_cvbr,
+    td_u32 frame_rate, hi_pic_size size)
+{
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+
+    switch (size) {
+        case PIC_D1_NTSC:
+            h265_cvbr->max_bit_rate = 1024 + 512 * frame_rate / 30;           /* 1024 512 30 is a number */
+            h265_cvbr->long_term_max_bit_rate = 1024 + 512 * frame_rate / 30; /* 1024 512 30 is a number */
+            h265_cvbr->long_term_min_bit_rate = 256;                          /* 256 is a number */
+            break;
+
+        case PIC_720P:
+            h265_cvbr->max_bit_rate = 1024 * 2 + 1024 * frame_rate / 30;           /* 1024 2 1024 30 is a number */
+            h265_cvbr->long_term_max_bit_rate = 1024 * 2 + 1024 * frame_rate / 30; /* 1024 2 1024 30 is a number */
+            h265_cvbr->long_term_min_bit_rate = 512;                               /* 512 is a number */
+            break;
+
+        case PIC_1080P:
+            h265_cvbr->max_bit_rate = 1024 * 2 + 2048 * frame_rate / 30;           /* 1024 2 2048 30 is a number */
+            h265_cvbr->long_term_max_bit_rate = 1024 * 2 + 2048 * frame_rate / 30; /* 1024 2 2048 30 is a number */
+            h265_cvbr->long_term_min_bit_rate = 1024;                              /* 1024 is a number */
+            break;
+
+        case PIC_2592X1944:
+            h265_cvbr->max_bit_rate = 1024 * 4 + 3072 * frame_rate / 30;           /* 1024 4 3072 30 is a number */
+            h265_cvbr->long_term_max_bit_rate = 1024 * 3 + 3072 * frame_rate / 30; /* 1024 3 3072 30 is a number */
+            h265_cvbr->long_term_min_bit_rate = 1024 * 2;                          /* 1024 2 is a number */
+            break;
+
+        case PIC_3840X2160:
+            h265_cvbr->max_bit_rate = 1024 * 8 + 5120 * frame_rate / 30;           /* 1024 8 5120 30 is a number */
+            h265_cvbr->long_term_max_bit_rate = 1024 * 5 + 5120 * frame_rate / 30; /* 1024 5 5120 30 is a number */
+            h265_cvbr->long_term_min_bit_rate = 1024 * 3;                          /* 1024 3 is a number */
+            break;
+
+        case PIC_4000X3000:
+            h265_cvbr->max_bit_rate = 1024 * 12 + 5120 * frame_rate / 30;           /* 1024 12 5120 30 is a number */
+            h265_cvbr->long_term_max_bit_rate = 1024 * 10 + 5120 * frame_rate / 30; /* 1024 10 5120 30 is a number */
+            h265_cvbr->long_term_min_bit_rate = 1024 * 4;                           /* 1024 4 is a number */
+            break;
+
+        case PIC_7680X4320:
+            h265_cvbr->max_bit_rate = 1024 * 24 + 5120 * frame_rate / 30;           /* 1024 24 5120 30 is a number */
+            h265_cvbr->long_term_max_bit_rate = 1024 * 15 + 5120 * frame_rate / 30; /* 1024 15 5120 30 is a number */
+            h265_cvbr->long_term_min_bit_rate = 1024 * 5;                           /* 1024 5 is a number */
+            break;
+
+        default:
+            h265_cvbr->max_bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / /* 3072: 3M */
+                (1920 * 1080); /* 1920, 1080: FHD */
+            h265_cvbr->long_term_max_bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / /* 3072: 3M */
+                (1920 * 1080); /* 1920, 1080: FHD */
+            h265_cvbr->long_term_min_bit_rate = 1024 * 5;                           /* 1024 5 is a number */
+            break;
+    }
+}
+
+static td_void sample_easyvenc_comm_venc_set_h264_cvbr_bit_rate(ot_venc_chn_attr *venc_chn_attr, ot_venc_h264_cvbr *h264_cvbr,
+    td_u32 frame_rate, hi_pic_size size)
+{
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+
+    switch (size) {
+        case PIC_D1_NTSC:
+            h264_cvbr->max_bit_rate = 1024 + 512 * frame_rate / 30;           /* 1024 512 30 is a number */
+            h264_cvbr->long_term_max_bit_rate = 1024 + 512 * frame_rate / 30; /* 1024 512 30 is a number */
+            h264_cvbr->long_term_min_bit_rate = 256;                          /* 256 is a number */
+            break;
+        case PIC_720P:
+            h264_cvbr->max_bit_rate = 1024 * 2 + 1024 * frame_rate / 30;           /* 1024 2 1024 30 is a number */
+            h264_cvbr->long_term_max_bit_rate = 1024 * 2 + 1024 * frame_rate / 30; /* 1024 2 1024 30 is a number */
+            h264_cvbr->long_term_min_bit_rate = 512;                               /* 512 is a number */
+            break;
+        case PIC_1080P:
+            h264_cvbr->max_bit_rate = 1024 * 2 + 2048 * frame_rate / 30;           /* 1024 2 2048 30 is a number */
+            h264_cvbr->long_term_max_bit_rate = 1024 * 2 + 2048 * frame_rate / 30; /* 1024 2 2048 30 is a number */
+            h264_cvbr->long_term_min_bit_rate = 1024;                              /* 1024 is a number */
+            break;
+        case PIC_2592X1944:
+            h264_cvbr->max_bit_rate = 1024 * 4 + 3072 * frame_rate / 30;           /* 1024 4 3072 30 is a number */
+            h264_cvbr->long_term_max_bit_rate = 1024 * 3 + 3072 * frame_rate / 30; /* 1024 3 3072 30 is a number */
+            h264_cvbr->long_term_min_bit_rate = 1024 * 2;                          /* 1024 2 is a number */
+            break;
+        case PIC_3840X2160:
+            h264_cvbr->max_bit_rate = 1024 * 8 + 5120 * frame_rate / 30;           /* 1024 8 5120 30 is a number */
+            h264_cvbr->long_term_max_bit_rate = 1024 * 5 + 5120 * frame_rate / 30; /* 1024 5 5120 30 is a number */
+            h264_cvbr->long_term_min_bit_rate = 1024 * 3;                          /* 1024 3 is a number */
+            break;
+        case PIC_4000X3000:
+            h264_cvbr->max_bit_rate = 1024 * 12 + 5120 * frame_rate / 30;           /* 1024 12 5120 30 is a number */
+            h264_cvbr->long_term_max_bit_rate = 1024 * 10 + 5120 * frame_rate / 30; /* 1024 10 5120 30 is a number */
+            h264_cvbr->long_term_min_bit_rate = 1024 * 4;                           /* 1024 4 is a number */
+            break;
+        case PIC_7680X4320:
+            h264_cvbr->max_bit_rate = 1024 * 24 + 5120 * frame_rate / 30;           /* 1024 24 5120 30 is a number */
+            h264_cvbr->long_term_max_bit_rate = 1024 * 15 + 5120 * frame_rate / 30; /* 1024 15 5120 30 is a number */
+            h264_cvbr->long_term_min_bit_rate = 1024 * 5;                           /* 1024 5 is a number */
+            break;
+        default:
+            h264_cvbr->max_bit_rate = ((td_u64)4096 * (pic_width * pic_height)) /   /* 4096: 4M */
+                (1920 * 1080); /* 1920, 1080: FHD */
+            h264_cvbr->long_term_max_bit_rate = ((td_u64)4096 * (pic_width * pic_height)) /   /* 4096: 4M */
+                (1920 * 1080); /* 1920, 1080: FHD */
+            h264_cvbr->long_term_min_bit_rate = 1024 * 5;                           /* 1024 5 is a number */
+            break;
+    }
+}
+
+static td_void sample_easyvenc_comm_venc_set_svac3_cvbr_bit_rate(ot_venc_chn_attr *venc_chn_attr, ot_venc_svac3_cvbr *svac3_cvbr,
+    td_u32 frame_rate, hi_pic_size size)
+{
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+
+    switch (size) {
+        case PIC_D1_NTSC:
+            svac3_cvbr->max_bit_rate = 1024 + 512 * frame_rate / 30;           /* 1024 512 30 is a number */
+            svac3_cvbr->long_term_max_bit_rate = 1024 + 512 * frame_rate / 30; /* 1024 512 30 is a number */
+            svac3_cvbr->long_term_min_bit_rate = 256;                          /* 256 is a number */
+            break;
+
+        case PIC_720P:
+            svac3_cvbr->max_bit_rate = 1024 * 2 + 1024 * frame_rate / 30;           /* 1024 2 1024 30 is a number */
+            svac3_cvbr->long_term_max_bit_rate = 1024 * 2 + 1024 * frame_rate / 30; /* 1024 2 1024 30 is a number */
+            svac3_cvbr->long_term_min_bit_rate = 512;                               /* 512 is a number */
+            break;
+
+        case PIC_1080P:
+            svac3_cvbr->max_bit_rate = 1024 * 2 + 2048 * frame_rate / 30;           /* 1024 2 2048 30 is a number */
+            svac3_cvbr->long_term_max_bit_rate = 1024 * 2 + 2048 * frame_rate / 30; /* 1024 2 2048 30 is a number */
+            svac3_cvbr->long_term_min_bit_rate = 1024;                              /* 1024 is a number */
+            break;
+
+        case PIC_2592X1944:
+            svac3_cvbr->max_bit_rate = 1024 * 4 + 3072 * frame_rate / 30;           /* 1024 4 3072 30 is a number */
+            svac3_cvbr->long_term_max_bit_rate = 1024 * 3 + 3072 * frame_rate / 30; /* 1024 3 3072 30 is a number */
+            svac3_cvbr->long_term_min_bit_rate = 1024 * 2;                          /* 1024 2 is a number */
+            break;
+
+        case PIC_3840X2160:
+            svac3_cvbr->max_bit_rate = 1024 * 8 + 5120 * frame_rate / 30;           /* 1024 8 5120 30 is a number */
+            svac3_cvbr->long_term_max_bit_rate = 1024 * 5 + 5120 * frame_rate / 30; /* 1024 5 5120 30 is a number */
+            svac3_cvbr->long_term_min_bit_rate = 1024 * 3;                          /* 1024 3 is a number */
+            break;
+
+        case PIC_4000X3000:
+            svac3_cvbr->max_bit_rate = 1024 * 12 + 5120 * frame_rate / 30;           /* 1024 12 5120 30 is a number */
+            svac3_cvbr->long_term_max_bit_rate = 1024 * 10 + 5120 * frame_rate / 30; /* 1024 10 5120 30 is a number */
+            svac3_cvbr->long_term_min_bit_rate = 1024 * 4;                           /* 1024 4 is a number */
+            break;
+
+        case PIC_7680X4320:
+            svac3_cvbr->max_bit_rate = 1024 * 24 + 5120 * frame_rate / 30;           /* 1024 24 5120 30 is a number */
+            svac3_cvbr->long_term_max_bit_rate = 1024 * 15 + 5120 * frame_rate / 30; /* 1024 15 5120 30 is a number */
+            svac3_cvbr->long_term_min_bit_rate = 1024 * 5;                           /* 1024 5 is a number */
+            break;
+
+        default:
+            svac3_cvbr->max_bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / /* 3072: 3M */
+                (1920 * 1080); /* 1920, 1080: FHD */
+            svac3_cvbr->long_term_max_bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / /* 3072: 3M */
+                (1920 * 1080); /* 1920, 1080: FHD */
+            svac3_cvbr->long_term_min_bit_rate = 1024 * 5;                           /* 1024 5 is a number */
+            break;
+    }
+}
+
+static td_void sample_easyvenc_comm_venc_h264_cvbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate, hi_pic_size size)
+{
+    ot_venc_h264_cvbr h264_cvbr;
+
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H264_CVBR;
+    h264_cvbr.gop = gop;
+    h264_cvbr.stats_time = stats_time;
+    h264_cvbr.src_frame_rate = frame_rate;
+    h264_cvbr.dst_frame_rate = frame_rate;
+    h264_cvbr.long_term_stats_time = 1;
+    h264_cvbr.short_term_stats_time = stats_time;
+
+    sample_easyvenc_comm_venc_set_h264_cvbr_bit_rate(venc_chn_attr, &h264_cvbr, frame_rate, size);
+
+    venc_chn_attr->rc_attr.h264_cvbr = h264_cvbr;
+}
+
+static td_void sample_easyvenc_comm_venc_h265_cvbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate, hi_pic_size size)
+{
+    ot_venc_h265_cvbr h265_cvbr;
+
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H265_CVBR;
+    h265_cvbr.gop = gop;
+    h265_cvbr.stats_time = stats_time;
+    h265_cvbr.src_frame_rate = frame_rate;
+    h265_cvbr.dst_frame_rate = frame_rate;
+    h265_cvbr.long_term_stats_time = 1;
+    h265_cvbr.short_term_stats_time = stats_time;
+
+    sample_easyvenc_comm_venc_set_h265_cvbr_bit_rate(venc_chn_attr, &h265_cvbr, frame_rate, size);
+
+    venc_chn_attr->rc_attr.h265_cvbr = h265_cvbr;
+}
+
+static td_void sample_easyvenc_comm_venc_svac3_cvbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate, hi_pic_size size)
+{
+    ot_venc_svac3_cvbr svac3_cvbr;
+
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_SVAC3_CVBR;
+    svac3_cvbr.gop = gop;
+    svac3_cvbr.stats_time = stats_time;
+    svac3_cvbr.src_frame_rate = frame_rate;
+    svac3_cvbr.dst_frame_rate = frame_rate;
+    svac3_cvbr.long_term_stats_time = 1;
+    svac3_cvbr.short_term_stats_time = stats_time;
+
+    sample_easyvenc_comm_venc_set_svac3_cvbr_bit_rate(venc_chn_attr, &svac3_cvbr, frame_rate, size);
+
+    venc_chn_attr->rc_attr.svac3_cvbr = svac3_cvbr;
+}
+
+static td_void sample_easyvenc_comm_venc_h264_avbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_h264_avbr h264_avbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H264_AVBR;
+    h264_avbr.gop = gop;
+    h264_avbr.stats_time = stats_time;
+    h264_avbr.src_frame_rate = frame_rate;
+    h264_avbr.dst_frame_rate = frame_rate;
+    h264_avbr.max_bit_rate = ((td_u64)4096 * (pic_width * pic_height)) / (1920 * 1080); /* 4096: 4M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.h264_avbr = h264_avbr;
+}
+
+static td_void sample_easyvenc_comm_venc_h265_avbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_h265_avbr h265_avbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H265_AVBR;
+    h265_avbr.gop = gop;
+    h265_avbr.stats_time = stats_time;
+    h265_avbr.src_frame_rate = frame_rate;
+    h265_avbr.dst_frame_rate = frame_rate;
+    h265_avbr.max_bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / (1920 * 1080); /* 3072: 3M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.h265_avbr = h265_avbr;
+}
+
+static td_void sample_easyvenc_comm_venc_svac3_avbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_svac3_avbr svac3_avbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_SVAC3_AVBR;
+    svac3_avbr.gop = gop;
+    svac3_avbr.stats_time = stats_time;
+    svac3_avbr.src_frame_rate = frame_rate;
+    svac3_avbr.dst_frame_rate = frame_rate;
+    svac3_avbr.max_bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / (1920 * 1080); /* 3072: 3M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.svac3_avbr = svac3_avbr;
+}
+
+static td_void sample_easyvenc_comm_venc_mjpeg_vbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_mjpeg_vbr mjpeg_vbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_MJPEG_VBR;
+    mjpeg_vbr.stats_time = stats_time;
+    mjpeg_vbr.src_frame_rate = frame_rate;
+    mjpeg_vbr.dst_frame_rate = frame_rate;
+    mjpeg_vbr.max_bit_rate = ((td_u64)20480 * (pic_width * pic_height)) / /* 20480: 20M */
+        (1920 * 1080); /* 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.mjpeg_vbr = mjpeg_vbr;
+}
+
+static td_void sample_easyvenc_comm_venc_h264_vbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_h264_vbr h264_vbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H264_VBR;
+    h264_vbr.gop = gop;
+    h264_vbr.stats_time = stats_time;
+    h264_vbr.src_frame_rate = frame_rate;
+    h264_vbr.dst_frame_rate = frame_rate;
+    h264_vbr.max_bit_rate = ((td_u64)4096 * (pic_width * pic_height)) / (1920 * 1080); /* 4096: 4M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.h264_vbr = h264_vbr;
+}
+
+static td_void sample_easyvenc_comm_venc_h265_vbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_h265_vbr h265_vbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H265_VBR;
+    h265_vbr.gop = gop;
+    h265_vbr.stats_time = stats_time;
+    h265_vbr.src_frame_rate = frame_rate;
+    h265_vbr.dst_frame_rate = frame_rate;
+    h265_vbr.max_bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / (1920 * 1080); /* 3072: 3M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.h265_vbr = h265_vbr;
+}
+
+static td_void sample_easyvenc_comm_venc_svac3_vbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_svac3_vbr svac3_vbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_SVAC3_VBR;
+    svac3_vbr.gop = gop;
+    svac3_vbr.stats_time = stats_time;
+    svac3_vbr.src_frame_rate = frame_rate;
+    svac3_vbr.dst_frame_rate = frame_rate;
+    svac3_vbr.max_bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / (1920 * 1080); /* 3072: 3M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.svac3_vbr = svac3_vbr;
+}
+
+static td_void sample_easyvenc_comm_venc_mjpeg_fixqp_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 frame_rate)
+{
+    ot_venc_mjpeg_fixqp mjpege_fixqp;
+
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_MJPEG_FIXQP;
+    mjpege_fixqp.qfactor = 50; /* 50 is a number */
+    mjpege_fixqp.src_frame_rate = frame_rate;
+    mjpege_fixqp.dst_frame_rate = frame_rate;
+
+    venc_chn_attr->rc_attr.mjpeg_fixqp = mjpege_fixqp;
+}
+
+static td_void sample_easyvenc_comm_venc_h264_fixqp_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 frame_rate)
+{
+    ot_venc_h264_fixqp h264_fixqp;
+
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H264_FIXQP;
+    h264_fixqp.gop = gop;
+    h264_fixqp.src_frame_rate = frame_rate;
+    h264_fixqp.dst_frame_rate = frame_rate;
+    h264_fixqp.i_qp = 25; /* 25 is a number */
+    h264_fixqp.p_qp = 30; /* 30 is a number */
+    h264_fixqp.b_qp = 32; /* 32 is a number */
+    venc_chn_attr->rc_attr.h264_fixqp = h264_fixqp;
+}
+
+static td_void sample_easyvenc_comm_venc_h265_fixqp_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 frame_rate)
+{
+    ot_venc_h265_fixqp h265_fixqp;
+
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H265_FIXQP;
+    h265_fixqp.gop = gop;
+    h265_fixqp.src_frame_rate = frame_rate;
+    h265_fixqp.dst_frame_rate = frame_rate;
+    h265_fixqp.i_qp = 25; /* 25 is a number */
+    h265_fixqp.p_qp = 30; /* 30 is a number */
+    h265_fixqp.b_qp = 32; /* 32 is a number */
+    venc_chn_attr->rc_attr.h265_fixqp = h265_fixqp;
+}
+
+static td_void sample_easyvenc_comm_venc_svac3_fixqp_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 frame_rate)
+{
+    ot_venc_svac3_fixqp svac3_fixqp;
+
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_SVAC3_FIXQP;
+    svac3_fixqp.gop = gop;
+    svac3_fixqp.src_frame_rate = frame_rate;
+    svac3_fixqp.dst_frame_rate = frame_rate;
+    svac3_fixqp.i_qp = 25; /* 25 is a number */
+    svac3_fixqp.p_qp = 30; /* 30 is a number */
+    svac3_fixqp.b_qp = 32; /* 32 is a number */
+    venc_chn_attr->rc_attr.svac3_fixqp = svac3_fixqp;
+}
+
+static td_void sample_easyvenc_comm_venc_mjpeg_cbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_mjpeg_cbr mjpege_cbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_MJPEG_CBR;
+    mjpege_cbr.stats_time = stats_time;
+    mjpege_cbr.src_frame_rate = frame_rate;
+    mjpege_cbr.dst_frame_rate = frame_rate;
+    mjpege_cbr.bit_rate = ((td_u64)20480 * (pic_width * pic_height)) / (1920 * 1080); /* 20480: 20M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.mjpeg_cbr = mjpege_cbr;
+}
+
+static td_void sample_easyvenc_comm_venc_h264_cbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_h264_cbr h264_cbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H264_CBR;
+    h264_cbr.gop = gop;
+    h264_cbr.stats_time = stats_time;     /* stream rate statics time(s) */
+    h264_cbr.src_frame_rate = frame_rate; /* input (vi) frame rate */
+    h264_cbr.dst_frame_rate = frame_rate; /* target frame rate */
+    h264_cbr.bit_rate = ((td_u64)4096 * (pic_width * pic_height)) / (1920 * 1080); /* 4096: 4M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.h264_cbr = h264_cbr;
+}
+
+static td_void sample_easyvenc_comm_venc_h265_cbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_h265_cbr h265_cbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H265_CBR;
+    h265_cbr.gop = gop;
+    h265_cbr.stats_time = stats_time;     /* stream rate statics time(s) */
+    h265_cbr.src_frame_rate = frame_rate; /* input (vi) frame rate */
+    h265_cbr.dst_frame_rate = frame_rate; /* target frame rate */
+    h265_cbr.bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / (1920 * 1080); /* 3072: 3M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.h265_cbr = h265_cbr;
+}
+
+static td_void sample_easyvenc_comm_venc_svac3_cbr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_svac3_cbr svac3_cbr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_SVAC3_CBR;
+    svac3_cbr.gop = gop;
+    svac3_cbr.stats_time = stats_time;     /* stream rate statics time(s) */
+    svac3_cbr.src_frame_rate = frame_rate; /* input (vi) frame rate */
+    svac3_cbr.dst_frame_rate = frame_rate; /* target frame rate */
+    svac3_cbr.bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / (1920 * 1080); /* 3072: 3M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.svac3_cbr = svac3_cbr;
+}
+
+static td_void sample_easyvenc_comm_venc_h264_abr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_h264_abr h264_abr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H264_ABR;
+    h264_abr.gop = gop;
+    h264_abr.stats_time = stats_time;     /* stream rate statics time(s) */
+    h264_abr.src_frame_rate = frame_rate; /* input (vi) frame rate */
+    h264_abr.dst_frame_rate = frame_rate; /* target frame rate */
+    h264_abr.vbv_buf_delay  = 50; // 50: vbv_buf_delay
+    h264_abr.bit_rate = ((td_u64)4096 * (pic_width * pic_height)) / (1920 * 1080); /* 4096: 4M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.h264_abr = h264_abr;
+}
+
+static td_void sample_easyvenc_comm_venc_h265_abr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_h265_abr h265_abr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_H265_ABR;
+    h265_abr.gop = gop;
+    h265_abr.stats_time = stats_time;     /* stream rate statics time(s) */
+    h265_abr.src_frame_rate = frame_rate; /* input (vi) frame rate */
+    h265_abr.dst_frame_rate = frame_rate; /* target frame rate */
+    h265_abr.vbv_buf_delay  = 50; // 50: vbv_buf_delay
+    h265_abr.bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / (1920 * 1080); /* 3072: 3M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.h265_abr = h265_abr;
+}
+
+static td_void sample_easyvenc_comm_venc_svac3_abr_param_init(ot_venc_chn_attr *venc_chn_attr, td_u32 gop, td_u32 stats_time,
+    td_u32 frame_rate)
+{
+    ot_venc_svac3_abr svac3_abr;
+    td_u32  pic_width;
+    td_u32  pic_height;
+
+    pic_width = venc_chn_attr->venc_attr.pic_width;
+    pic_height = venc_chn_attr->venc_attr.pic_height;
+    venc_chn_attr->rc_attr.rc_mode = OT_VENC_RC_MODE_SVAC3_ABR;
+    svac3_abr.gop = gop;
+    svac3_abr.stats_time = stats_time;     /* stream rate statics time(s) */
+    svac3_abr.src_frame_rate = frame_rate; /* input (vi) frame rate */
+    svac3_abr.dst_frame_rate = frame_rate; /* target frame rate */
+    svac3_abr.vbv_buf_delay  = 50; // 50: vbv_buf_delay
+    svac3_abr.bit_rate = ((td_u64)3072 * (pic_width * pic_height)) / (1920 * 1080); /* 3072: 3M 1920, 1080: FHD */
+    venc_chn_attr->rc_attr.svac3_abr = svac3_abr;
+}
+
+static td_s32 sample_easyvenc_comm_venc_jpeg_param_init(ot_venc_chn_attr *venc_chn_attr)
+{
+    ot_venc_jpeg_attr jpeg_attr;
+    jpeg_attr.dcf_en = TD_FALSE;
+    jpeg_attr.mpf_cfg.large_thumbnail_num = 0;
+    jpeg_attr.recv_mode = OT_VENC_PIC_RECV_SINGLE;
+
+    venc_chn_attr->venc_attr.jpeg_attr = jpeg_attr;
+
+    return TD_SUCCESS;
+}
+
+
+static td_s32 sample_easyvenc_comm_venc_mjpeg_param_init(ot_venc_chn_attr *venc_chn_attr,
+    sample_comm_venc_chn_param *venc_create_chn_param)
+{
+    sample_rc rc_mode = venc_create_chn_param->rc_mode;
+    td_u32 stats_time = venc_create_chn_param->stats_time;
+    td_u32 frame_rate = venc_create_chn_param->frame_rate;
+
+    if (rc_mode == SAMPLE_RC_FIXQP) {
+        sample_easyvenc_comm_venc_mjpeg_fixqp_param_init(venc_chn_attr, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_CBR) {
+        sample_easyvenc_comm_venc_mjpeg_cbr_param_init(venc_chn_attr, stats_time, frame_rate);
+    } else if ((rc_mode == SAMPLE_RC_VBR) || (rc_mode == SAMPLE_RC_AVBR)) {
+        if (rc_mode == SAMPLE_RC_AVBR) {
+            sample_print("mjpege not support AVBR, so change rcmode to VBR!\n");
+        }
+        sample_easyvenc_comm_venc_mjpeg_vbr_param_init(venc_chn_attr, stats_time, frame_rate);
+    } else {
+        sample_print("can't support other mode(%d) in this version!\n", rc_mode);
+        return TD_FAILURE;
+    }
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_easyvenc_comm_venc_h264_param_init(ot_venc_chn_attr *chn_attr, sample_comm_venc_chn_param *chn_param)
+{
+    sample_rc rc_mode = chn_param->rc_mode;
+    td_u32 gop = chn_param->gop;
+    td_u32 stats_time = chn_param->stats_time;
+    td_u32 frame_rate = chn_param->frame_rate;
+    hi_pic_size size = chn_param->size;
+
+    chn_attr->venc_attr.h264_attr.frame_buf_ratio = SAMPLE_FRAME_BUF_RATIO_DEFAULT;
+    if (rc_mode == SAMPLE_RC_ABR) {
+        sample_easyvenc_comm_venc_h264_abr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_CBR) {
+        sample_easyvenc_comm_venc_h264_cbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_FIXQP) {
+        sample_easyvenc_comm_venc_h264_fixqp_param_init(chn_attr, gop, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_VBR) {
+        sample_easyvenc_comm_venc_h264_vbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_AVBR) {
+        sample_easyvenc_comm_venc_h264_avbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_CVBR) {
+        sample_easyvenc_comm_venc_h264_cvbr_param_init(chn_attr, gop, stats_time, frame_rate, size);
+    } else if (rc_mode == SAMPLE_RC_QVBR) {
+        sample_easyvenc_comm_venc_h264_qvbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_QPMAP) {
+        sample_easyvenc_comm_venc_h264_qpmap_param_init(chn_attr, gop, frame_rate, stats_time);
+    } else {
+        sample_print("%s,%d,rc_mode(%d) not support\n", __FUNCTION__, __LINE__, rc_mode);
+        return TD_FAILURE;
+    }
+    chn_attr->venc_attr.h264_attr.rcn_ref_share_buf_en = chn_param->is_rcn_ref_share_buf;
+
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_easyvenc_comm_venc_h265_param_init(ot_venc_chn_attr *chn_attr, sample_comm_venc_chn_param *chn_param)
+{
+    sample_rc rc_mode = chn_param->rc_mode;
+    td_u32 gop = chn_param->gop;
+    td_u32 stats_time = chn_param->stats_time;
+    td_u32 frame_rate = chn_param->frame_rate;
+    hi_pic_size size = chn_param->size;
+
+    chn_attr->venc_attr.h265_attr.frame_buf_ratio = SAMPLE_FRAME_BUF_RATIO_DEFAULT;
+    if (rc_mode == SAMPLE_RC_ABR) {
+        sample_easyvenc_comm_venc_h265_abr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_CBR) {
+        sample_easyvenc_comm_venc_h265_cbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_FIXQP) {
+        sample_easyvenc_comm_venc_h265_fixqp_param_init(chn_attr, gop, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_VBR) {
+        sample_easyvenc_comm_venc_h265_vbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_AVBR) {
+        sample_easyvenc_comm_venc_h265_avbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_CVBR) {
+        sample_easyvenc_comm_venc_h265_cvbr_param_init(chn_attr, gop, stats_time, frame_rate, size);
+    } else if (rc_mode == SAMPLE_RC_QVBR) {
+        sample_easyvenc_comm_venc_h265_qvbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_QPMAP) {
+        sample_easyvenc_comm_venc_h265_qpmap_param_init(chn_attr, gop, frame_rate, stats_time);
+    } else {
+        sample_print("%s,%d,rc_mode(%d) not support\n", __FUNCTION__, __LINE__, rc_mode);
+        return TD_FAILURE;
+    }
+    chn_attr->venc_attr.h265_attr.rcn_ref_share_buf_en = chn_param->is_rcn_ref_share_buf;
+
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_easyvenc_comm_venc_svac3_param_init(ot_venc_chn_attr *chn_attr, sample_comm_venc_chn_param *chn_param)
+{
+    sample_rc rc_mode = chn_param->rc_mode;
+    td_u32 gop = chn_param->gop;
+    td_u32 stats_time = chn_param->stats_time;
+    td_u32 frame_rate = chn_param->frame_rate;
+    hi_pic_size size = chn_param->size;
+
+    chn_attr->venc_attr.svac3_attr.frame_buf_ratio = SAMPLE_FRAME_BUF_RATIO_DEFAULT;
+    if (rc_mode == SAMPLE_RC_ABR) {
+        sample_easyvenc_comm_venc_svac3_abr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_CBR) {
+        sample_easyvenc_comm_venc_svac3_cbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_FIXQP) {
+        sample_easyvenc_comm_venc_svac3_fixqp_param_init(chn_attr, gop, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_VBR) {
+        sample_easyvenc_comm_venc_svac3_vbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_AVBR) {
+        sample_easyvenc_comm_venc_svac3_avbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_CVBR) {
+        sample_easyvenc_comm_venc_svac3_cvbr_param_init(chn_attr, gop, stats_time, frame_rate, size);
+    } else if (rc_mode == SAMPLE_RC_QVBR) {
+        sample_easyvenc_comm_venc_svac3_qvbr_param_init(chn_attr, gop, stats_time, frame_rate);
+    } else if (rc_mode == SAMPLE_RC_QPMAP) {
+        sample_easyvenc_comm_venc_svac3_qpmap_param_init(chn_attr, gop, frame_rate, stats_time);
+    } else {
+        sample_print("%s,%d,rc_mode(%d) not support\n", __FUNCTION__, __LINE__, rc_mode);
+        return TD_FAILURE;
+    }
+    chn_attr->venc_attr.svac3_attr.rcn_ref_share_buf_en = chn_param->is_rcn_ref_share_buf;
+
+    return TD_SUCCESS;
+}
+
+static td_void sample_easyvenc_comm_venc_set_gop_attr(ot_payload_type type, ot_venc_chn_attr *chn_attr,
+    ot_venc_gop_attr *gop_attr)
+{
+    if (type == OT_PT_MJPEG || type == OT_PT_JPEG) {
+        chn_attr->gop_attr.gop_mode = OT_VENC_GOP_MODE_NORMAL_P;
+        chn_attr->gop_attr.normal_p.ip_qp_delta = 0;
+    } else {
+        chn_attr->gop_attr = *gop_attr;
+        if ((gop_attr->gop_mode == OT_VENC_GOP_MODE_BIPRED_B) && (type == OT_PT_H264)) {
+            if (chn_attr->venc_attr.profile == 0) {
+                chn_attr->venc_attr.profile = 1;
+
+                sample_print("H.264 base profile not support BIPREDB, so change profile to main profile!\n");
+            }
+        }
+    }
+}
+
+static td_s32 sample_easyvenc_comm_venc_channel_param_init(sample_comm_venc_chn_param *chn_param, ot_venc_chn_attr *chn_attr)
+{
+    td_s32 ret;
+    ot_venc_gop_attr *gop_attr = &chn_param->gop_attr;
+    td_u32 profile = chn_param->profile;
+    ot_payload_type type = chn_param->type;
+    ot_size venc_size = chn_param->venc_size;
+
+    chn_attr->venc_attr.type = type;
+    chn_attr->venc_attr.max_pic_width = venc_size.width;
+    chn_attr->venc_attr.max_pic_height = venc_size.height;
+    chn_attr->venc_attr.pic_width = venc_size.width;   /* the picture width */
+    chn_attr->venc_attr.pic_height = venc_size.height; /* the picture height */
+
+    if (type == OT_PT_MJPEG || type == OT_PT_JPEG) {
+        chn_attr->venc_attr.buf_size =
+            OT_ALIGN_UP(venc_size.width, 16) * OT_ALIGN_UP(venc_size.height, 16) * 4; /* 16 4 is a number */
+    } else {
+        chn_attr->venc_attr.buf_size =
+            OT_ALIGN_UP(venc_size.width * venc_size.height * 3 / 4, 64); /*  3  4 64 is a number */
+    }
+    chn_attr->venc_attr.profile = profile;
+    chn_attr->venc_attr.is_by_frame = TD_TRUE; /* get stream mode is slice mode or frame mode? */
+
+    if (gop_attr->gop_mode == OT_VENC_GOP_MODE_SMART_P) {
+        chn_param->stats_time = gop_attr->smart_p.bg_interval / chn_param->gop;
+    }
+
+    switch (type) {
+        case OT_PT_H265:
+            ret = sample_easyvenc_comm_venc_h265_param_init(chn_attr, chn_param);
+            break;
+
+        case OT_PT_H264:
+            ret = sample_easyvenc_comm_venc_h264_param_init(chn_attr, chn_param);
+            break;
+
+        case OT_PT_MJPEG:
+            ret = sample_easyvenc_comm_venc_mjpeg_param_init(chn_attr, chn_param);
+            break;
+
+        case OT_PT_JPEG:
+            ret = sample_easyvenc_comm_venc_jpeg_param_init(chn_attr);
+            break;
+
+        case OT_PT_SVAC3:
+            ret = sample_easyvenc_comm_venc_svac3_param_init(chn_attr, chn_param);
+            break;
+
+        default:
+            sample_print("can't support this type (%d) in this version!\n", type);
+            return OT_ERR_VENC_NOT_SUPPORT;
+    }
+
+    sample_easyvenc_comm_venc_set_gop_attr(type, chn_attr, gop_attr);
+
+    return ret;
+}
+
+td_s32 sample_easyvenc_comm_venc_create(ot_venc_chn venc_chn, sample_comm_venc_chn_param *chn_param)
+{
+    td_s32 ret;
+    ot_venc_chn_attr venc_chn_attr;
+    hi_pic_size size = chn_param->size;
+
+    if ((td_s32)size != -1) {
+        if (sample_comm_sys_get_pic_size(size, &chn_param->venc_size) != TD_SUCCESS) {
+            sample_print("get picture size failed!\n");
+            return TD_FAILURE;
+        }
+    }
+
+    /* step 1:  create venc channel */
+    if ((ret = sample_easyvenc_comm_venc_channel_param_init(chn_param, &venc_chn_attr)) != TD_SUCCESS) {
+        sample_print("venc_channel_param_init failed!\n");
+        return ret;
+    }
+
+    if ((ret = ss_mpi_venc_create_chn(venc_chn, &venc_chn_attr)) != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_create_chn [%d] failed with %#x! ===\n", venc_chn, ret);
+        return ret;
+    }
+
+    if (chn_param->type == OT_PT_JPEG) {
+        return TD_SUCCESS;
+    }
+
+    if ((ret = sample_easyvenc_comm_venc_close_reencode(venc_chn)) != TD_SUCCESS) {
+        ss_mpi_venc_destroy_chn(venc_chn);
+        return ret;
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_easyvenc_comm_venc_set_mod_type(ot_payload_type payload_type, ot_venc_mod_param *mod_param)
+{
+    switch (payload_type) {
+        case OT_PT_H264:
+            mod_param->mod_type = OT_VENC_MOD_H264;
+            break;
+        case OT_PT_H265:
+            mod_param->mod_type = OT_VENC_MOD_H265;
+            break;
+        case OT_PT_MJPEG:
+            mod_param->mod_type = OT_VENC_MOD_JPEG;
+            break;
+        case OT_PT_JPEG:
+            mod_param->mod_type = OT_VENC_MOD_JPEG;
+            break;
+        case OT_PT_SVAC3:
+            mod_param->mod_type = OT_VENC_MOD_SVAC3;
+            break;
+        default:
+            return TD_FAILURE;
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_easyvenc_comm_venc_set_mini_buf(ot_payload_type payload_type, ot_venc_mod_param *mod_param)
+{
+    switch (payload_type) {
+        case OT_PT_H264:
+            mod_param->h264_mod_param.mini_buf_mode = 1;
+            break;
+        case OT_PT_H265:
+            mod_param->h265_mod_param.mini_buf_mode = 1;
+            break;
+        case OT_PT_MJPEG:
+            mod_param->jpeg_mod_param.mini_buf_mode = 1;
+            break;
+        case OT_PT_JPEG:
+            mod_param->jpeg_mod_param.mini_buf_mode = 1;
+            break;
+        case OT_PT_SVAC3:
+            mod_param->svac3_mod_param.mini_buf_mode = 1;
+            break;
+        default:
+            return TD_FAILURE;
+    }
+
+    return TD_SUCCESS;
+}
+
+td_s32 sample_easyvenc_comm_venc_mini_buf_en(sample_comm_venc_chn_param *chn_param, td_s32 venc_chn_num)
+{
+    td_s32 i, ret;
+    ot_venc_mod_param mod_param = {0};
+
+    for (i = 0; i < venc_chn_num; i++) {
+        ret = sample_easyvenc_comm_venc_set_mod_type(chn_param[i].type, &mod_param);
+        if (ret != TD_SUCCESS) {
+            sample_print("unsupport payload type \n");
+            return TD_FAILURE;
+        }
+
+        ret = ss_mpi_venc_get_mod_param(&mod_param);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_venc_get_mod_param failed with %#x!\n", ret);
+            return ret;
+        }
+
+        ret = sample_easyvenc_comm_venc_set_mini_buf(chn_param[i].type, &mod_param);
+        if (ret != TD_SUCCESS) {
+            sample_print("unsupport payload type \n");
+            return TD_FAILURE;
+        }
+
+        ret = ss_mpi_venc_set_mod_param(&mod_param);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_venc_set_mod_param failed with %#x!\n", ret);
+            return ret;
+        }
+    }
+
+    return TD_SUCCESS;
+}
+
+/*
+ * function : start venc stream mode
+ * note     : rate control parameter need adjust, according your case.
+ */
+td_s32 sample_easyvenc_comm_venc_start(ot_venc_chn venc_chn, sample_comm_venc_chn_param *chn_param)
+{
+    td_s32 ret;
+    ot_venc_start_param start_param;
+
+    /* step 1: create encode chnl */
+    if ((ret = sample_easyvenc_comm_venc_create(venc_chn, chn_param)) != TD_SUCCESS) {
+        sample_print("sample_easyvenc_comm_venc_create failed with%#x! \n", ret);
+        return TD_FAILURE;
+    }
+    /* step 2:  start recv venc pictures */
+    start_param.recv_pic_num = -1;
+    if ((ret = ss_mpi_venc_start_chn(venc_chn, &start_param)) != TD_SUCCESS) {
+        ss_mpi_venc_destroy_chn(venc_chn);
+        sample_print("ss_mpi_venc_start_recv_pic failed with%#x! \n", ret);
+        return TD_FAILURE;
+    }
+    return TD_SUCCESS;
+}
+
+/* function : stop venc (stream mode-- H264, MJPEG) */
+td_s32 sample_easyvenc_comm_venc_stop(ot_venc_chn venc_chn)
+{
+    td_s32 ret;
+
+    /* stop venc chn */
+    ret = ss_mpi_venc_stop_chn(venc_chn);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_stop_chn vechn[%d] failed with %#x!\n", venc_chn, ret);
+    }
+
+    /* distroy venc channel */
+    ret = ss_mpi_venc_destroy_chn(venc_chn);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_destroy_chn vechn[%d] failed with %#x!\n", venc_chn, ret);
+        return TD_FAILURE;
+    }
+    return TD_SUCCESS;
+}
+
+static td_void sample_easyvenc_comm_venc_chn_cfg(ot_size *size, td_bool support_dcf, ot_venc_chn_attr *venc_chn_attr)
+{
+    venc_chn_attr->venc_attr.type = OT_PT_JPEG;
+    venc_chn_attr->venc_attr.max_pic_width = size->width;
+    venc_chn_attr->venc_attr.max_pic_height = size->height;
+    venc_chn_attr->venc_attr.pic_width = size->width;
+    venc_chn_attr->venc_attr.pic_height = size->height;
+    venc_chn_attr->venc_attr.buf_size = size->width * size->height * 2; /* 2 is a number */
+    venc_chn_attr->venc_attr.is_by_frame = TD_TRUE; /* get stream mode is field mode or frame mode */
+    venc_chn_attr->venc_attr.profile = 0;
+    venc_chn_attr->venc_attr.jpeg_attr.dcf_en = support_dcf;
+    venc_chn_attr->venc_attr.jpeg_attr.mpf_cfg.large_thumbnail_num = 0;
+    venc_chn_attr->venc_attr.jpeg_attr.recv_mode = OT_VENC_PIC_RECV_SINGLE;
+}
+
+/* start snap */
+td_s32 sample_easyvenc_comm_venc_snap_start(ot_venc_chn venc_chn, ot_size *size, td_bool support_dcf)
+{
+    td_s32 ret;
+    ot_venc_chn_attr venc_chn_attr;
+    ot_venc_start_param start_param;
+
+    /* step 1:  create venc channel */
+    sample_easyvenc_comm_venc_chn_cfg(size, support_dcf, &venc_chn_attr);
+
+    ret = ss_mpi_venc_create_chn(venc_chn, &venc_chn_attr);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_create_chn [%d] failed with %#x!\n", venc_chn, ret);
+        return ret;
+    }
+
+    ret = ss_mpi_venc_set_jpeg_enc_mode(venc_chn, OT_VENC_JPEG_ENC_SNAP);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_set_jpeg_enc_mode faild with%#x!\n", ret);
+        ss_mpi_venc_destroy_chn(venc_chn);
+        return TD_FAILURE;
+    }
+
+    start_param.recv_pic_num = -1;
+    ret = ss_mpi_venc_start_chn(venc_chn, &start_param);
+    if (ret != TD_SUCCESS) {
+        ss_mpi_venc_destroy_chn(venc_chn);
+        sample_print("mpi_venc_start_chn faild with%#x!\n", ret);
+        return TD_FAILURE;
+    }
+
+    return TD_SUCCESS;
+}
+
+/* start photo */
+td_s32 sample_easyvenc_comm_venc_photo_start(ot_venc_chn venc_chn, ot_size *size, td_bool support_dcf)
+{
+    td_s32 ret;
+    ot_venc_chn_attr venc_chn_attr;
+    ot_venc_start_param start_param;
+
+    /* step 1:  create venc channel */
+    sample_easyvenc_comm_venc_chn_cfg(size, support_dcf, &venc_chn_attr);
+
+    ret = ss_mpi_venc_create_chn(venc_chn, &venc_chn_attr);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_create_chn [%d] failed with %#x!\n", venc_chn, ret);
+        return ret;
+    }
+
+    start_param.recv_pic_num = -1;
+    ret = ss_mpi_venc_start_chn(venc_chn, &start_param);
+    if (ret != TD_SUCCESS) {
+        sample_print("mpi_venc_start_chn faild with%#x!\n", ret);
+        return TD_FAILURE;
+    }
+
+    return TD_SUCCESS;
+}
+
+/* stop snap */
+td_s32 sample_easyvenc_comm_venc_snap_stop(ot_venc_chn venc_chn)
+{
+    td_s32 ret;
+    ret = ss_mpi_venc_stop_chn(venc_chn);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_stop_chn vechn[%d] failed with %#x!\n", venc_chn, ret);
+        return TD_FAILURE;
+    }
+    ret = ss_mpi_venc_destroy_chn(venc_chn);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_destroy_chn vechn[%d] failed with %#x!\n", venc_chn, ret);
+        return TD_FAILURE;
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_easyvenc_comm_save_snap_stream(ot_venc_stream *stream, td_bool save_jpg, td_bool save_thm)
+{
+    td_s32 ret;
+    char stream_file[FILE_NAME_LEN] = {0};
+    FILE *file = TD_NULL;
+    td_s32 fd = -1;
+
+    if (snprintf_s(stream_file, FILE_NAME_LEN, FILE_NAME_LEN - 1, "snap_%d.jpg", g_easyvenc_snap_cnt) < 0) {
+        return TD_FAILURE;
+    }
+    fd = open(stream_file, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        sample_print("open file err\n");
+        return TD_FAILURE;
+    }
+
+    file = fdopen(fd, "wb");
+    if (file == NULL) {
+        sample_print("fdopen err\n");
+        goto CLOSE_FILE;
+    }
+
+    ret = sample_easyvenc_comm_venc_save_stream(file, stream);
+    if (ret != TD_SUCCESS) {
+        sample_print("save snap picture failed!\n");
+        goto CLOSE_FILE;
+    }
+
+    if (save_thm) {
+        char file_dcf[FILE_NAME_LEN] = {0};
+        if (snprintf_s(file_dcf, FILE_NAME_LEN, FILE_NAME_LEN - 1, "snap_thm_%d.jpg", g_easyvenc_snap_cnt) < 0) {
+            goto CLOSE_FILE;
+        }
+
+        ret = sample_easyvenc_comm_venc_get_dcf_info(stream_file, FILE_NAME_LEN, file_dcf, FILE_NAME_LEN);
+        if (ret != TD_SUCCESS) {
+            sample_print("save thm picture failed!\n");
+            goto CLOSE_FILE;
+        }
+    }
+
+    (td_void)fclose(file);
+    file = TD_NULL;
+    close(fd);
+    g_easyvenc_snap_cnt++;
+
+    return TD_SUCCESS;
+
+CLOSE_FILE:
+    if (file != TD_NULL) {
+        (td_void)fclose(file);
+        file = TD_NULL;
+    }
+    close(fd);
+
+    return TD_FAILURE;
+}
+
+static td_s32 sample_easyvenc_comm_get_snap_stream(ot_venc_chn venc_chn, td_bool save_jpg, td_bool save_thm)
+{
+    td_s32 ret = TD_SUCCESS;
+    ot_venc_chn_status stat;
+    ot_venc_stream stream;
+
+    ret = ss_mpi_venc_query_status(venc_chn, &stat);
+    if (ret != TD_SUCCESS) {
+        sample_print("query_status failed with %#x!\n", ret);
+        return TD_FAILURE;
+    }
+
+    if (stat.cur_packs == 0) {
+        sample_print("NOTE: Current frame is NULL!\n");
+        return TD_SUCCESS;
+    }
+    stream.pack = (ot_venc_pack *)malloc(sizeof(ot_venc_pack) * stat.cur_packs);
+    if (stream.pack == NULL) {
+        sample_print("malloc memory failed!\n");
+        return TD_FAILURE;
+    }
+    stream.pack_cnt = stat.cur_packs;
+    ret = ss_mpi_venc_get_stream(venc_chn, &stream, -1);
+    if (ret != TD_SUCCESS) {
+        sample_print("get_stream failed with %#x!\n", ret);
+        goto FREE_RES;
+    }
+    if (save_jpg || save_thm) {
+        ret = sample_easyvenc_comm_save_snap_stream(&stream, save_jpg, save_thm);
+        if (ret != TD_SUCCESS) {
+            sample_print("save_snap_stream failed!\n");
+            goto FREE_RES;
+        }
+    }
+
+    ret = ss_mpi_venc_release_stream(venc_chn, &stream);
+    if (ret != TD_SUCCESS) {
+        sample_print("release_stream failed with %#x!\n", ret);
+        goto FREE_RES;
+    }
+
+FREE_RES:
+    free(stream.pack);
+    stream.pack = NULL;
+
+    return ret;
+}
+
+/* *****************************************************************************
+* funciton : snap process
+ * **************************************************************************** */
+td_s32 sample_easyvenc_comm_venc_snap_process(ot_venc_chn venc_chn, td_u32 snap_cnt, td_bool save_jpg, td_bool save_thm)
+{
+    struct timeval timeout_val;
+    fd_set read_fds;
+    td_s32 venc_fd;
+    td_s32 ret;
+    td_u32 i;
+
+    /* *****************************************
+     step 4:  recv picture
+    ***************************************** */
+    venc_fd = ss_mpi_venc_get_fd(venc_chn);
+    if (venc_fd < 0) {
+        sample_print("venc_get_fd faild with%#x!\n", venc_fd);
+        return TD_FAILURE;
+    }
+
+    for (i = 0; i < snap_cnt; i++) {
+        FD_ZERO(&read_fds);
+        FD_SET(venc_fd, &read_fds);
+        timeout_val.tv_sec = 10; // 10 : 10 seconds
+        timeout_val.tv_usec = 0;
+        ret = select(venc_fd + 1, &read_fds, NULL, NULL, &timeout_val);
+        if (ret < 0) {
+            sample_print("snap select failed!\n");
+            return TD_FAILURE;
+        } else if (ret == 0) {
+            sample_print("snap time out!\n");
+            return TD_FAILURE;
+        } else {
+            if (FD_ISSET(venc_fd, &read_fds)) {
+                check_return(sample_easyvenc_comm_get_snap_stream(venc_chn, save_jpg, save_thm), "get_snap_stream");
+            }
+        }
+    }
+
+    return TD_SUCCESS;
+}
+
+td_s32 sample_easyvenc_comm_venc_save_jpeg(ot_venc_chn venc_chn, td_u32 snap_cnt)
+{
+    struct timeval timeout_val;
+    fd_set read_fds;
+    td_s32 venc_fd;
+    td_s32 ret;
+    td_u32 i;
+    /* *****************************************
+     step:  recv picture
+    ***************************************** */
+    venc_fd = ss_mpi_venc_get_fd(venc_chn);
+    if (venc_fd < 0) {
+        sample_print("venc_get_fd faild with%#x!\n", venc_fd);
+        return TD_FAILURE;
+    }
+    for (i = 0; i < snap_cnt; i++) {
+        FD_ZERO(&read_fds);
+        FD_SET(venc_fd, &read_fds);
+        timeout_val.tv_sec = 10; // 10 : 10 seconds
+        timeout_val.tv_usec = 0;
+        ret = select(venc_fd + 1, &read_fds, NULL, NULL, &timeout_val);
+        if (ret < 0) {
+            sample_print("snap select failed!\n");
+            return TD_FAILURE;
+        } else if (ret == 0) {
+            sample_print("snap time out!\n");
+            return TD_FAILURE;
+        } else {
+            if (FD_ISSET(venc_fd, &read_fds)) {
+                check_return(sample_easyvenc_comm_get_snap_stream(venc_chn, TD_TRUE, TD_FALSE), "get_snap_stream");
+            }
+        }
+    }
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_easyvenc_comm_alloc_qpmap_skipweight_memory(sample_venc_qpmap_sendframe_para *para,
+    sample_easyvenc_comm_venc_frame_proc_info *addr_info)
+{
+    ot_venc_chn_attr venc_chn_attr = {0};
+    td_s32 ret;
+    td_u32 i, j;
+    td_u8 *vir_addr = TD_NULL;
+    td_phys_addr_t phys_addr = 0;
+
+    for (i = 0; (i < para->cnt) && (i < OT_VENC_MAX_CHN_NUM); i++) {
+        if (ss_mpi_venc_get_chn_attr(para->venc_chn[i], &venc_chn_attr) != TD_SUCCESS) {
+            return TD_FAILURE;
+        }
+
+        addr_info->qpmap_size[i] = ot_venc_get_qpmap_size(venc_chn_attr.venc_attr.type,
+            para->size[i].width, para->size[i].height);
+        addr_info->skip_weight_size[i] =
+            ot_venc_get_skip_weight_size(venc_chn_attr.venc_attr.type, para->size[i].width, para->size[i].height);
+
+        /* alloc qpmap memory */
+        ret = ss_mpi_sys_mmz_alloc((td_phys_addr_t *)&phys_addr, (td_void **)&vir_addr, TD_NULL, TD_NULL,
+            addr_info->qpmap_size[i] * QPMAP_BUF_NUM);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_sys_mmz_alloc err:0x%x", ret);
+            return ret;
+        }
+        for (j = 0; (i < VENC_QPMAP_MAX_CHN) && (j < QPMAP_BUF_NUM); j++) {
+            if ((j > 0) && (addr_info->qpmap_size[i] > (UINT_MAX / j))) {
+                sample_print("(j * addr_info->qpmap_size[%u]) upper limit of the multiplie\n", i);
+                ss_mpi_sys_mmz_free(phys_addr, vir_addr);
+                return TD_FAILURE;
+            } else {
+                addr_info->qpmap_phys_addr[i][j] = (td_phys_addr_t)(phys_addr + j * addr_info->qpmap_size[i]);
+                addr_info->qpmap_vir_addr[i][j] = vir_addr + j * addr_info->qpmap_size[i];
+            }
+        }
+
+        /* alloc skipWeight memory */
+        ret = ss_mpi_sys_mmz_alloc((td_phys_addr_t *)&phys_addr, (td_void **)&vir_addr, TD_NULL, TD_NULL,
+            addr_info->skip_weight_size[i] * QPMAP_BUF_NUM);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_sys_mmz_alloc err:0x%x", ret);
+            return ret;
+        }
+        for (j = 0; (i < VENC_QPMAP_MAX_CHN) && (j < QPMAP_BUF_NUM); j++) {
+            if ((j > 0) && (addr_info->skip_weight_size[i] > (UINT_MAX / j))) {
+                sample_print("(j * addr_info->skip_weight_size[%d]) upper limit of the multiplie\n", i);
+                ss_mpi_sys_mmz_free(phys_addr, vir_addr);
+                return TD_FAILURE;
+            } else {
+                addr_info->skip_weight_phys_addr[i][j] =
+                    (td_phys_addr_t)(phys_addr + j * addr_info->skip_weight_size[i]);
+                addr_info->skip_weight_vir_addr[i][j] = vir_addr + j * addr_info->skip_weight_size[i];
+            }
+        }
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_void sample_easyvenc_comm_venc_vir_addr_temp(sample_easyvenc_comm_venc_frame_proc_info *addr_info, td_u32 i, td_u32 frame_id)
+{
+    td_u32 j;
+    td_u8 *vir_addr_temp = TD_NULL;
+
+    vir_addr_temp = (td_u8 *)addr_info->qpmap_vir_addr[i][frame_id];
+    for (j = 0; j < addr_info->qpmap_size[i]; j++) {
+        *vir_addr_temp = 0x5E; // [7]:skip flag; [6]:QpType Flag; [5:0]:Qp value ==> Set absolute qp = 30
+        vir_addr_temp++;
+    }
+
+    vir_addr_temp = (td_u8 *)addr_info->skip_weight_vir_addr[i][frame_id];
+    for (j = 0; j < addr_info->skip_weight_size[i]; j++) {
+        *vir_addr_temp = 0x66; // inter block must be skip
+        vir_addr_temp++;
+    }
+}
+
+
+static td_s32 sample_easyvenc_comm_qpmap_send_frame_ex(sample_venc_qpmap_sendframe_para *para,
+    ot_venc_user_frame_info *frame_info, ot_video_frame_info *video_frame, td_s32 index)
+{
+    td_s32 ret;
+
+    ret = ss_mpi_venc_send_frame_ex(para->venc_chn[index], frame_info, -1);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_send_frame_ex err:0x%x\n", ret);
+
+        ret = ss_mpi_vpss_release_chn_frame(para->vpss_grp, para->vpss_chn[index], video_frame);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_vpss_release_chn_frame err:0x%x", ret);
+            return SAMPLE_RETURN_GOTO;
+        }
+        return SAMPLE_RETURN_BREAK;
+    }
+
+    return TD_SUCCESS;
+}
+
+static ot_venc_user_frame_info* sample_easyvenc_comm_malloc_frame_martix(td_s32 chn_num, td_s32 buf_num)
+{
+    ot_venc_user_frame_info* frame_info = TD_NULL;
+    size_t malloc_size = sizeof(ot_venc_user_frame_info) * chn_num * buf_num;
+
+    if (chn_num == 0 || buf_num == 0) {
+        sample_print("malloc_size error, chn_num %d, buf_num %d\n", chn_num, buf_num);
+        return TD_NULL;
+    }
+
+    frame_info = malloc(malloc_size);
+    if (frame_info == NULL) {
+        sample_print("malloc error\n");
+        return TD_NULL;
+    }
+
+    if (memset_s(frame_info, malloc_size, 0, malloc_size) != EOK) {
+        free(frame_info);
+        return TD_NULL;
+    }
+    return frame_info;
+}
+
+static td_s32 sample_easyvenc_comm_qpmap_send_frame_start(sample_venc_qpmap_sendframe_para *para,
+    sample_easyvenc_comm_venc_frame_proc_info *addr_info)
+{
+    td_u32 frame_id = 0;
+    td_u32 i;
+    td_s32 ret = TD_SUCCESS;
+    ot_venc_user_frame_info *frame_info = sample_easyvenc_comm_malloc_frame_martix(VENC_QPMAP_MAX_CHN, QPMAP_BUF_NUM);
+
+    if (frame_info == TD_NULL) {
+        return TD_FAILURE;
+    }
+
+    while (para->thread_start == TD_TRUE) {
+        for (i = 0; (i < para->cnt) && (i < VENC_QPMAP_MAX_CHN) &&
+            i * QPMAP_BUF_NUM + frame_id < VENC_QPMAP_MAX_CHN * QPMAP_BUF_NUM; i++) {
+            ot_video_frame_info *video_frame = &frame_info[i * QPMAP_BUF_NUM + frame_id].user_frame;
+
+            if ((ret = ss_mpi_vpss_get_chn_frame(para->vpss_grp, para->vpss_chn[i],
+                video_frame, 1000)) != TD_SUCCESS) { /* 1000 is a number */
+                sample_print("OT_MPI_VPSS_GetChnFrame err:0x%x\n", ret);
+                continue;
+            }
+
+            sample_easyvenc_comm_venc_vir_addr_temp(addr_info, i, frame_id);
+
+            frame_info[i * QPMAP_BUF_NUM + frame_id].user_rc_info.skip_weight_valid = 1;
+            frame_info[i * QPMAP_BUF_NUM + frame_id].user_rc_info.skip_weight_phys_addr =
+                addr_info->skip_weight_phys_addr[i][frame_id];
+            frame_info[i * QPMAP_BUF_NUM + frame_id].user_rc_info.qpmap_valid = 1;
+            frame_info[i * QPMAP_BUF_NUM + frame_id].user_rc_info.qpmap_phys_addr =
+                addr_info->qpmap_phys_addr[i][frame_id];
+            frame_info[i * QPMAP_BUF_NUM + frame_id].user_rc_info.blk_start_qp = 30; /* 30 is a number */
+            frame_info[i * QPMAP_BUF_NUM + frame_id].user_rc_info.frame_type = OT_VENC_FRAME_TYPE_NONE;
+
+            ret = sample_easyvenc_comm_qpmap_send_frame_ex(para, &frame_info[i * QPMAP_BUF_NUM + frame_id], video_frame, i);
+            if (ret == SAMPLE_RETURN_BREAK) {
+                break;
+            } else if (ret == SAMPLE_RETURN_GOTO) {
+                goto FREE;
+            }
+
+            if ((ret = ss_mpi_vpss_release_chn_frame(para->vpss_grp, para->vpss_chn[i], video_frame)) != TD_SUCCESS) {
+                sample_print("ss_mpi_vpss_release_chn_frame err:0x%x", ret);
+                goto FREE;
+            }
+
+            if (++frame_id >= QPMAP_BUF_NUM) {
+                frame_id = 0;
+            }
+        }
+    }
+
+FREE:
+    free(frame_info);
+    return ret;
+}
+
+td_void *sample_easyvenc_comm_qpmap_send_frame_proc(td_void *p)
+{
+    td_s32 ret;
+    td_u32 i;
+    sample_venc_qpmap_sendframe_para *para = TD_NULL;
+    sample_easyvenc_comm_venc_frame_proc_info addr_info = { 0 };
+    ot_vpss_chn_attr vpss_chn_attr;
+
+    para = (sample_venc_qpmap_sendframe_para *)p;
+
+    if (para->cnt > VENC_QPMAP_MAX_CHN) {
+        sample_print("Current func'sample_easyvenc_comm_qpmap_send_frame_proc' not support Venc channal num(%u) > %d\n",
+            para->cnt, VENC_QPMAP_MAX_CHN);
+        return TD_NULL;
+    }
+
+    if (sample_easyvenc_comm_alloc_qpmap_skipweight_memory(para, &addr_info) != TD_SUCCESS) {
+        goto error;
+    }
+
+    /* set vpss buffer depth */
+    for (i = 0; (i < para->cnt) && (i < OT_VPSS_MAX_PHYS_CHN_NUM); i++) {
+        ret = ss_mpi_vpss_get_chn_attr(para->vpss_grp, para->vpss_chn[i], &vpss_chn_attr);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_vpss_get_chn_attr err:0x%x", ret);
+            goto error;
+        }
+
+        vpss_chn_attr.depth = 3; /* 3 is a number */
+        ret = ss_mpi_vpss_set_chn_attr(para->vpss_grp, para->vpss_chn[i], &vpss_chn_attr);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_vpss_set_chn_attr err:0x%x", ret);
+            goto error;
+        }
+    }
+
+    if (sample_easyvenc_comm_qpmap_send_frame_start(para, &addr_info) != TD_SUCCESS) {
+        goto error;
+    }
+
+error:
+    for (i = 0; (i < para->cnt) && (i < VENC_QPMAP_MAX_CHN); i++) {
+        if (addr_info.qpmap_phys_addr[i][0] != 0) {
+            ret = ss_mpi_sys_mmz_free(addr_info.qpmap_phys_addr[i][0], addr_info.qpmap_vir_addr[i][0]);
+            if (ret != TD_SUCCESS) {
+                sample_print("ss_mpi_sys_mmz_free err:0x%x", ret);
+            }
+        }
+
+        if (addr_info.skip_weight_phys_addr[i][0] != 0) {
+            ret = ss_mpi_sys_mmz_free(addr_info.skip_weight_phys_addr[i][0], addr_info.skip_weight_vir_addr[i][0]);
+            if (ret != TD_SUCCESS) {
+                sample_print("ss_mpi_sys_mmz_free err:0x%x", ret);
+            }
+        }
+    }
+    return TD_NULL;
+}
+
+td_s32 sample_easyvenc_comm_venc_qpmap_send_frame(ot_vpss_grp vpss_grp, ot_vpss_chn vpss_chn[], ot_venc_chn venc_chn[],
+    td_s32 cnt, ot_size size[])
+{
+    td_s32 i;
+
+    g_qpmap_send_frame_para.thread_start = TD_TRUE;
+    g_qpmap_send_frame_para.vpss_grp = vpss_grp;
+    g_qpmap_send_frame_para.cnt = (td_u32)cnt;
+
+    for (i = 0; (i < cnt) && (i < OT_VENC_MAX_CHN_NUM) && (i < OT_VPSS_MAX_PHYS_CHN_NUM); i++) {
+        g_qpmap_send_frame_para.venc_chn[i] = venc_chn[i];
+        g_qpmap_send_frame_para.vpss_chn[i] = vpss_chn[i];
+        g_qpmap_send_frame_para.size[i] = size[i];
+    }
+
+    return pthread_create(&g_venc_qpmap_pid, 0, sample_easyvenc_comm_qpmap_send_frame_proc, (td_void *)&g_qpmap_send_frame_para);
+}
+
+#define SAMPLE_VENC_BLOCK_WIDTH 16
+#define SAMPLE_VENC_BLOCK_HEIGHT 16
+#define SAMPLE_VENC_ONE_BYTE_BLOCKS 4
+#define SAMPLE_VENC_ONE_BLOCK_BITS 2
+#define SAMPLE_VENC_MAX_JPEG_ROI_LEVEL 3
+
+
+#define SAMPLE_VENC_ROIMAP_MAX_CHN 2
+
+
+static td_s32 sample_easyvenc_comm_set_file_name(td_s32 index, ot_venc_chn venc_chn,
+    sample_comm_venc_stream_proc_info *stream_proc_info)
+{
+    if (snprintf_s(stream_proc_info->file_name[index], FILE_NAME_LEN, FILE_NAME_LEN - 1, "./") < 0) {
+        return TD_FAILURE;
+    }
+
+    if (realpath(stream_proc_info->file_name[index], stream_proc_info->real_file_name[index]) == TD_NULL) {
+        sample_print("chn[%d] stream file path error\n", venc_chn);
+        return TD_FAILURE;
+    }
+
+    if (snprintf_s(stream_proc_info->real_file_name[index], FILE_NAME_LEN, FILE_NAME_LEN - 1,
+        "stream_chn%d%s", index, stream_proc_info->file_postfix) < 0) {
+        return TD_FAILURE;
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_void sample_easyvenc_comm_close_save_file(sample_comm_venc_stream_proc_info *stream_proc_info)
+{
+    td_s32 i;
+
+    for (i = 0; i < stream_proc_info->chn_total && i < OT_VENC_MAX_CHN_NUM; i++) {
+        if (stream_proc_info->file[i] != TD_NULL) {
+            fclose(stream_proc_info->file[i]);
+            stream_proc_info->file[i] = TD_NULL;
+        }
+    }
+}
+
+static td_void sample_easyvenc_comm_close_save_file_svc(sample_comm_venc_stream_proc_info *stream_proc_info)
+{
+    td_s32 i, cnt;
+
+    for (i = 0; i < stream_proc_info->chn_total && i < OT_VENC_MAX_CHN_NUM; i++) {
+        for (cnt = 0; cnt < 3; cnt++) { /* 3 is a number */
+            if (stream_proc_info->file[i + cnt]) {
+                fclose(stream_proc_info->file[i + cnt]);
+                stream_proc_info->file[i + cnt] = TD_NULL;
+            }
+        }
+    }
+}
+
+static td_s32 sample_easyvenc_comm_set_name_save_stream(sample_comm_venc_stream_proc_info *stream_proc_info,
+    ot_venc_stream_buf_info *stream_buf_info, ot_payload_type *payload_type,
+    sample_venc_getstream_para *para, td_s32 venc_max_chn)
+{
+    td_s32 i, ret, fd;
+    ot_venc_chn_attr venc_chn_attr;
+    ot_unused(venc_max_chn);
+
+    for (i = 0; (i < stream_proc_info->chn_total) && (i < OT_VENC_MAX_CHN_NUM); i++) {
+        /* decide the stream file name, and open file to save stream */
+        ot_venc_chn venc_chn = para->venc_chn[i];
+        ret = ss_mpi_venc_get_chn_attr(venc_chn, &venc_chn_attr);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_venc_get_chn_attr chn[%d] failed with %#x!\n", venc_chn, ret);
+            return SAMPLE_RETURN_NULL;
+        }
+        payload_type[i] = venc_chn_attr.venc_attr.type;
+
+        ret = sample_easyvenc_comm_venc_get_file_postfix(payload_type[i], stream_proc_info->file_postfix,
+            sizeof(stream_proc_info->file_postfix));
+        if (ret != TD_SUCCESS) {
+            sample_print("sample_easyvenc_comm_venc_get_file_postfix [%d] failed with %#x!\n",
+                venc_chn_attr.venc_attr.type, ret);
+            return SAMPLE_RETURN_NULL;
+        }
+
+        if (payload_type[i] != OT_PT_JPEG) {
+            ret = sample_easyvenc_comm_set_file_name(i, venc_chn, stream_proc_info);
+            if (ret != TD_SUCCESS) {
+                return ret;
+            }
+
+            stream_proc_info->file[i] = fopen(stream_proc_info->real_file_name[i], "wb");
+            if (!stream_proc_info->file[i]) {
+                sample_print("open file[%s] failed! (%d:%s)\n", stream_proc_info->real_file_name[i],
+                    errno, strerror(errno));
+                return SAMPLE_RETURN_FAILURE;
+            }
+            fd = fileno(stream_proc_info->file[i]);
+            fchmod(fd, S_IRUSR | S_IWUSR);
+        }
+        /* set venc fd. */
+        stream_proc_info->venc_fd[i] = ss_mpi_venc_get_fd(i);
+        if (stream_proc_info->venc_fd[i] < 0) {
+            sample_print("ss_mpi_venc_get_fd failed with %#x!\n", stream_proc_info->venc_fd[i]);
+            return SAMPLE_RETURN_NULL;
+        }
+
+        if (stream_proc_info->maxfd <= stream_proc_info->venc_fd[i]) {
+            stream_proc_info->maxfd = stream_proc_info->venc_fd[i];
+        }
+
+        ret = ss_mpi_venc_get_stream_buf_info(i, &stream_buf_info[i]);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_venc_get_stream_buf_info failed with %#x!\n", ret);
+            return SAMPLE_RETURN_FAILURE;
+        }
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_easyvenc_comm_save_frame_to_file(td_s32 index, sample_comm_venc_stream_proc_info *stream_proc_info,
+    ot_venc_stream *stream, ot_venc_stream_buf_info *stream_buf_info, ot_payload_type *payload_type)
+{
+    td_s32 ret, fd;
+    if (payload_type[index] == OT_PT_JPEG) {
+        if (snprintf_s(stream_proc_info->file_name[index], FILE_NAME_LEN, FILE_NAME_LEN - 1, "./") < 0) {
+            free(stream->pack);
+            return SAMPLE_RETURN_NULL;
+        }
+        if (realpath(stream_proc_info->file_name[index], stream_proc_info->real_file_name[index]) == TD_NULL) {
+            free(stream->pack);
+            sample_print("chn[%d] stream file path error\n", stream_proc_info->venc_chn);
+            return SAMPLE_RETURN_NULL;
+        }
+
+        if (snprintf_s(stream_proc_info->real_file_name[index], FILE_NAME_LEN, FILE_NAME_LEN - 1,
+            "stream_chn%d_%u%s", index, stream_proc_info->picture_cnt[index], stream_proc_info->file_postfix) < 0) {
+            free(stream->pack);
+            return SAMPLE_RETURN_NULL;
+        }
+        stream_proc_info->file[index] = fopen(stream_proc_info->real_file_name[index], "wb");
+        if (!stream_proc_info->file[index]) {
+            free(stream->pack);
+            sample_print("open file err!\n");
+            return SAMPLE_RETURN_NULL;
+        }
+        fd = fileno(stream_proc_info->file[index]);
+        fchmod(fd, S_IRUSR | S_IWUSR);
+    }
+
+#ifndef __LITEOS__
+    ot_unused(stream_buf_info);
+    ret = sample_easyvenc_comm_venc_save_stream(stream_proc_info->file[index], stream);
+#else
+    ret = sample_easyvenc_comm_venc_save_stream_phys_addr(stream_proc_info->file[index], &stream_buf_info[index], stream);
+#endif
+    if (ret != TD_SUCCESS) {
+        free(stream->pack);
+        stream->pack = TD_NULL;
+        sample_print("save stream failed!\n");
+        return SAMPLE_RETURN_BREAK;
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_easyvenc_comm_get_stream_from_one_channl(sample_comm_venc_stream_proc_info *stream_proc_info, td_s32 index,
+    ot_venc_stream_buf_info *stream_buf_info, ot_payload_type *payload_type)
+{
+    td_s32 ret;
+    ot_venc_stream stream;
+    ot_venc_chn_status stat;
+
+    /* step 2.1 : query how many packs in one-frame stream. */
+    if (memset_s(&stream, sizeof(stream), 0, sizeof(stream)) != EOK) {
+        printf("call memset_s error\n");
+    }
+
+    ret = ss_mpi_venc_query_status(index, &stat);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_query_status chn[%d] failed with %#x!\n", index, ret);
+        return SAMPLE_RETURN_BREAK;
+    }
+
+    if (stat.cur_packs == 0) {
+        sample_print("NOTE: current  frame is TD_NULL!\n");
+        return SAMPLE_RETURN_CONTINUE;
+    }
+    /* step 2.3 : malloc corresponding number of pack nodes. */
+    stream.pack = (ot_venc_pack *)malloc(sizeof(ot_venc_pack) * stat.cur_packs);
+    if (stream.pack == TD_NULL) {
+        sample_print("malloc stream pack failed!\n");
+        return SAMPLE_RETURN_BREAK;
+    }
+
+    /* step 2.4 : call mpi to get one-frame stream */
+    stream.pack_cnt = stat.cur_packs;
+    ret = ss_mpi_venc_get_stream(index, &stream, TD_TRUE);
+    if (ret != TD_SUCCESS) {
+        free(stream.pack);
+        stream.pack = TD_NULL;
+        sample_print("ss_mpi_venc_get_stream failed with %#x!\n", ret);
+        return SAMPLE_RETURN_BREAK;
+    }
+#if 0
+    /* step 2.5 : save frame to file */
+    ret = sample_easyvenc_comm_save_frame_to_file(index, stream_proc_info, &stream, stream_buf_info, payload_type);
+    if (ret != TD_SUCCESS) {
+        return ret;
+    }
+#endif
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+	
+	td_s32 tmp = 1;
+	if(video_type == 0x24){
+		tmp = 0;
+	}
+	if(index == tmp){ //0 h265 1 h264
+		/* step 2.5 : save frame to file */
+		ret = sample_easyvenc_comm_save_frame_to_file(index, stream_proc_info, &stream, stream_buf_info, payload_type);
+		if (ret != TD_SUCCESS) {
+			return ret;
+		}
+	}
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+
+    /* step 2.6 : release stream */
+    ret = ss_mpi_venc_release_stream(index, &stream);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_release_stream failed!\n");
+        free(stream.pack);
+        stream.pack = TD_NULL;
+        return SAMPLE_RETURN_BREAK;
+    }
+
+    /* step 2.7 : free pack nodes */
+    free(stream.pack);
+    stream.pack = TD_NULL;
+    stream_proc_info->picture_cnt[index]++;
+    if (payload_type[index] == OT_PT_JPEG) {
+        fclose(stream_proc_info->file[index]);
+        stream_proc_info->file[index] = TD_NULL;
+    }
+    return TD_SUCCESS;
+}
+
+
+static td_void sample_easyvenc_comm_fd_isset(sample_comm_venc_stream_proc_info *stream_proc_info, fd_set *read_fds,
+    ot_venc_stream_buf_info *stream_buf_info, ot_payload_type *payload_type, sample_venc_getstream_para *para)
+{
+    td_s32 i, ret;
+
+    for (i = 0; (i < stream_proc_info->chn_total) && (i < OT_VENC_MAX_CHN_NUM); i++) {
+        if (FD_ISSET(stream_proc_info->venc_fd[i], read_fds)) {
+            stream_proc_info->venc_chn = para->venc_chn[i];
+            ret = sample_easyvenc_comm_get_stream_from_one_channl(stream_proc_info, i, stream_buf_info, payload_type);
+            if (ret == SAMPLE_RETURN_CONTINUE) {
+                continue;
+            } else if (ret == SAMPLE_RETURN_BREAK) {
+                break;
+            }
+        }
+    }
+}
+
+/* get stream from each channels and save them */
+td_void *sample_easyvenc_comm_venc_get_venc_stream_proc(td_void *p)
+{
+    td_s32 i, ret;
+    fd_set read_fds;
+    struct timeval timeout_val = {0};
+    ot_payload_type payload_type[OT_VENC_MAX_CHN_NUM] = {0};
+    ot_venc_stream_buf_info stream_buf_info[OT_VENC_MAX_CHN_NUM];
+    sample_venc_getstream_para *para = (sample_venc_getstream_para *)p;
+    sample_comm_venc_stream_proc_info *stream_proc_info = malloc(sizeof(sample_comm_venc_stream_proc_info));
+
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+    pPacker.IFrame = 1;
+    pPacker.u32Ssrc = 1234567890123;//10进制的ssrc
+    pPacker.s64CurPts = 0;
+    buf = (char*)malloc(1024 * 1024);
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+
+    if (stream_proc_info == TD_NULL || memset_s(stream_proc_info, sizeof(sample_comm_venc_stream_proc_info), 0,
+        sizeof(sample_comm_venc_stream_proc_info)) != EOK) {
+        goto FREE;
+    }
+
+    prctl(PR_SET_NAME, "get_venc_stream", 0, 0, 0);
+
+    stream_proc_info->chn_total = para->cnt;
+
+    ret = sample_easyvenc_comm_set_name_save_stream(stream_proc_info, stream_buf_info, payload_type, para, OT_VENC_MAX_CHN_NUM);
+    if (ret == SAMPLE_RETURN_NULL) {
+        goto CLOSE_FILE;
+    } else if (ret == SAMPLE_RETURN_FAILURE) {
+        goto CLOSE_FILE;
+    }
+
+    while (para->thread_start == TD_TRUE) {
+        FD_ZERO(&read_fds);
+        for (i = 0; (i < stream_proc_info->chn_total) && (i < OT_VENC_MAX_CHN_NUM); i++) {
+            FD_SET(stream_proc_info->venc_fd[i], &read_fds);
+        }
+
+        timeout_val.tv_sec = 2; /* 2 is a number */
+        timeout_val.tv_usec = 0;
+        ret = select(stream_proc_info->maxfd + 1, &read_fds, TD_NULL, TD_NULL, &timeout_val);
+        if (ret < 0) {
+            sample_print("select failed!\n");
+            break;
+        } else if (ret == 0) {
+            sample_print("get venc stream time out, exit thread\n");
+            continue;
+        } else {
+            sample_easyvenc_comm_fd_isset(stream_proc_info, &read_fds, stream_buf_info, payload_type, para);
+        }
+    }
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+	free(buf);
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+CLOSE_FILE:
+    /* step 3 : close save-file */
+    sample_easyvenc_comm_close_save_file(stream_proc_info);
+FREE:
+    if (stream_proc_info != TD_NULL) {
+        free(stream_proc_info);
+    }
+
+    para->thread_start = TD_FALSE;
+    return TD_NULL;
+}
+
+/* *****************************************************************************
+* function : bitrate_auto
+ * **************************************************************************** */
+#define SAMPLE_VENC_WIDHT 640
+#define SAMPLE_VENC_HEIGHT 480
+#define SAMPLE_VENC_NUM 5
+#define SAMPLE_VENC_FG_TYPE 5
+#define QUERY_SLEEP 1000
+#define WAIT_GET_STREAM_THREAD_START_SLEEP 50
+#define WAIT_GET_STREAM_THREAD_START_TIMES 40
+
+td_void sample_easyvenc_comm_venc_set_region(td_u64 time, ot_venc_chn venc_chn, ot_venc_svc_rect_info *pst_svc_rect)
+{
+    td_s32 j, ret;
+    td_s32 attrx[SAMPLE_VENC_NUM] = {32, 96, 128, 192, 256}; // 32 96 128 192 256 : X-coordinate
+    td_s32 attry[SAMPLE_VENC_NUM] = {32, 96, 128, 192, 256}; // 32 96 128 192 256 : Y-coordinate
+    td_u32 attrw[SAMPLE_VENC_NUM] = {32, 64, 96, 96, 64};    // 32 64 96 96 64 : width
+    td_u32 attrh[SAMPLE_VENC_NUM] = {32, 64, 96, 96, 64};    // 32 64 96 96 64 : height
+    td_u32 type[SAMPLE_VENC_NUM] = {0, 3, 4, 1, 2};          // 0 3 4 1 2 : type
+    pst_svc_rect->rect_num = SAMPLE_VENC_NUM;
+    pst_svc_rect->pts = time;
+    pst_svc_rect->base_resolution.width = SAMPLE_VENC_WIDHT;
+    pst_svc_rect->base_resolution.height = SAMPLE_VENC_HEIGHT;
+
+    for (j = 0; (j < SAMPLE_VENC_NUM) && (j < OT_VENC_MAX_SVC_RECT_NUM); j++) {
+        pst_svc_rect->detect_type[j] = type[j];
+        pst_svc_rect->rect_attr[j].x = attrx[j];
+        pst_svc_rect->rect_attr[j].y = attry[j];
+        pst_svc_rect->rect_attr[j].width = attrw[j];
+        pst_svc_rect->rect_attr[j].height = attrh[j];
+    }
+    ret = ss_mpi_venc_send_svc_region(venc_chn, pst_svc_rect);
+    if (ret != TD_SUCCESS) {
+        sample_print("Set ss_mpi_venc_send_svc_region failed for %#x chn =%d\n", ret, venc_chn);
+    }
+}
+td_void sample_easyvenc_comm_venc_set_svc_param(ot_venc_chn venc_chn, ot_venc_svc_param *pst_svc_param)
+{
+    td_s32 j, ret;
+    td_u32 qp_i[SAMPLE_VENC_NUM] = {2, 62, 94, 1, 0}; // 2 62 94 1 0 : fg I frame qp
+    td_u32 qp_p[SAMPLE_VENC_NUM] = {4, 58, 94, 2, 0}; // 4 58 94 2 0 : fg P frame qp
+    ret = ss_mpi_venc_get_svc_param(venc_chn, pst_svc_param);
+    if (ret != TD_SUCCESS) {
+        sample_print("Set ss_mpi_venc_set_svc_param failed for %#x chn =%d\n", ret, venc_chn);
+    }
+    pst_svc_param->fg_protect_adaptive_en = TD_TRUE;
+    pst_svc_param->activity_region.qpmap_value_i = 0;
+    pst_svc_param->activity_region.qpmap_value_p = 0;
+    pst_svc_param->activity_region.skipmap_value = 0;
+    pst_svc_param->bg_region.qpmap_value_i = 2; // 2 :i frame bg qp
+    pst_svc_param->bg_region.qpmap_value_p = 6; // 6 :p frame bg qp
+    pst_svc_param->bg_region.skipmap_value = 0;
+    for (j = 0; (j < SAMPLE_VENC_NUM) && (j < SVC_RECT_TYPE_BUTT); j++) {
+        pst_svc_param->fg_region[j].qpmap_value_i = qp_i[j];
+        pst_svc_param->fg_region[j].qpmap_value_p = qp_p[j];
+        pst_svc_param->fg_region[j].skipmap_value = 0;
+    }
+    ret = ss_mpi_venc_set_svc_param(venc_chn, pst_svc_param);
+    if (ret != TD_SUCCESS) {
+        sample_print("Set ss_mpi_venc_set_svc_param failed for %#x!\n", ret);
+    }
+}
+
+td_void *sample_easyvenc_comm_venc_rateauto_stream_proc(td_void *p)
+{
+    td_s32 ret;
+    td_u32 i;
+    sample_venc_rateauto_para *para;
+    ot_venc_svc_param svc_param;
+    ot_vpss_chn_attr vpss_chn_attr;
+    ot_venc_svc_rect_info svc_rect_info = { 0 };
+    para = (sample_venc_rateauto_para *)p;
+    ot_video_frame_info video_frame;
+    prctl(PR_SET_NAME, "get_venc_rateauto_stream", 0, 0, 0);
+    if (para->cnt >= OT_VENC_MAX_CHN_NUM) {
+        sample_print("input count invalid\n");
+        return TD_NULL;
+    }
+    for (i = 0; (i < para->cnt) && (i < OT_VENC_MAX_CHN_NUM); i++) {
+        ret = ss_mpi_vpss_get_chn_attr(para->vpss_grp, para->vpss_chn[i], &vpss_chn_attr);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_vpss_get_chn_attr err: 0x%x", ret);
+        }
+
+        vpss_chn_attr.depth = 3; /* 3 is a number */
+        ret = ss_mpi_vpss_set_chn_attr(para->vpss_grp, para->vpss_chn[i], &vpss_chn_attr);
+        if (ret == TD_SUCCESS) {
+            sample_print("ss_mpi_vpss_set_chn_attr err: 0x%x", ret);
+        }
+    }
+
+    while (para->thread_start == TD_TRUE) {
+        for (i = 0; (i < para->cnt) && (i < OT_VENC_MAX_CHN_NUM); i++) {
+            ret = ss_mpi_vpss_get_chn_frame(para->vpss_grp, para->vpss_chn[i], &video_frame, QUERY_SLEEP);
+            if (ret != TD_SUCCESS) {
+                sample_print("ss_mpi_vpss_get_chn_frame err:0x%x venc_chn = %d\n", ret, para->venc_chn[i]);
+                continue;
+            }
+            ret = ss_mpi_vpss_release_chn_frame(para->vpss_grp, para->vpss_chn[i], &video_frame);
+            if (ret != TD_SUCCESS) {
+                sample_print("ss_mpi_vpss_release_chn_frame err:0x%x\n", ret);
+                return TD_NULL;
+            }
+
+            ret = ss_mpi_venc_enable_svc(para->venc_chn[i], TD_TRUE);
+            if (ret != TD_SUCCESS) {
+                sample_print("Set ss_mpi_venc_enable_svc failed for %#x!\n", ret);
+                return TD_NULL;
+            }
+            sample_easyvenc_comm_venc_set_region(video_frame.video_frame.pts, para->venc_chn[i], &svc_rect_info);
+            sample_easyvenc_comm_venc_set_svc_param(para->venc_chn[i], &svc_param);
+        }
+        usleep(QUERY_SLEEP);
+    }
+    return TD_NULL;
+}
+
+static td_s32 sample_easyvenc_comm_set_file_name_svc_t(sample_comm_venc_stream_proc_info *stream_proc_info, td_s32 index)
+{
+    if (snprintf_s(stream_proc_info->file_name[index], FILE_NAME_LEN, FILE_NAME_LEN - 1, "./") < 0) {
+        return TD_FAILURE;
+    }
+    if (realpath(stream_proc_info->file_name[index], stream_proc_info->real_file_name[index]) == TD_NULL) {
+        printf("file path error\n");
+        return TD_FAILURE;
+    }
+    if (snprintf_s(stream_proc_info->real_file_name[index], FILE_NAME_LEN, FILE_NAME_LEN - 1,
+        "tid%d%s", index, stream_proc_info->file_postfix) < 0) {
+        return TD_FAILURE;
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_easyvenc_comm_set_name_save_stream_svc_t(sample_comm_venc_stream_proc_info *stream_proc_info,
+    ot_venc_stream_buf_info *stream_buf_info, td_s32 venc_max_chn)
+{
+    td_s32 i, ret, cnt, fd;
+    ot_venc_chn_attr venc_chn_attr;
+    ot_payload_type payload_type[OT_VENC_MAX_CHN_NUM];
+    ot_unused(venc_max_chn);
+
+    for (i = 0; i < stream_proc_info->chn_total; i++) {
+        /* decide the stream file name, and open file to save stream */
+        stream_proc_info->venc_chn = i;
+        ret = ss_mpi_venc_get_chn_attr(stream_proc_info->venc_chn, &venc_chn_attr);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_venc_get_chn_attr chn[%d] failed with %#x!\n", stream_proc_info->venc_chn, ret);
+            return SAMPLE_RETURN_NULL;
+        }
+        payload_type[i] = venc_chn_attr.venc_attr.type;
+
+        ret = sample_easyvenc_comm_venc_get_file_postfix(payload_type[i], stream_proc_info->file_postfix,
+            sizeof(stream_proc_info->file_postfix));
+        if (ret != TD_SUCCESS) {
+            sample_print("sample_easyvenc_comm_venc_get_file_postfix [%d] failed with %#x!\n",
+                         venc_chn_attr.venc_attr.type, ret);
+            return SAMPLE_RETURN_NULL;
+        }
+
+        for (cnt = 0; cnt < 3; cnt++) { /* 3 is a number */
+            if (sample_easyvenc_comm_set_file_name_svc_t(stream_proc_info, (i + cnt)) != TD_SUCCESS) {
+                return SAMPLE_RETURN_NULL;
+            }
+
+            stream_proc_info->file[i + cnt] = fopen(stream_proc_info->real_file_name[i + cnt], "wb");
+            if (!stream_proc_info->file[i + cnt]) {
+                sample_print("open file[%s] failed!\n", stream_proc_info->real_file_name[i + cnt]);
+                return SAMPLE_RETURN_NULL;
+            }
+            fd = fileno(stream_proc_info->file[i + cnt]);
+            fchmod(fd, S_IRUSR | S_IWUSR);
+        }
+
+        /* set venc fd. */
+        stream_proc_info->venc_fd[i] = ss_mpi_venc_get_fd(i);
+        if (stream_proc_info->venc_fd[i] < 0) {
+            sample_print("ss_mpi_venc_get_fd failed with %#x!\n", stream_proc_info->venc_fd[i]);
+            return SAMPLE_RETURN_NULL;
+        }
+        if (stream_proc_info->maxfd <= stream_proc_info->venc_fd[i]) {
+            stream_proc_info->maxfd = stream_proc_info->venc_fd[i];
+        }
+        ret = ss_mpi_venc_get_stream_buf_info(i, &stream_buf_info[i]);
+        if (ret != TD_SUCCESS) {
+            sample_print("ss_mpi_venc_get_stream_buf_info failed with %#x!\n", ret);
+            return SAMPLE_RETURN_FAILURE;
+        }
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_void sample_easyvenc_comm_save_frame_to_file_svc_t(td_s32 index, sample_comm_venc_stream_proc_info *stream_proc_info,
+    ot_venc_stream *stream, ot_venc_stream_buf_info *stream_buf_info)
+{
+    td_s32 cnt, ret;
+
+    for (cnt = 0; cnt < 3; cnt++) { /* 3 is a number */
+        switch (cnt) {
+            case 0: /* 0 is a number */
+                if (stream->h264_info.ref_type == OT_VENC_BASE_IDR_SLICE ||
+                    stream->h264_info.ref_type == OT_VENC_BASE_P_SLICE_REF_BY_BASE) {
+#ifndef __LITEOS__
+                    ot_unused(stream_buf_info);
+                    ret = sample_easyvenc_comm_venc_save_stream(stream_proc_info->file[index + cnt], stream);
+#else
+                    ret = sample_easyvenc_comm_venc_save_stream_phys_addr(stream_proc_info->file[index + cnt],
+                        &stream_buf_info[index], stream);
+#endif
+                }
+                break;
+            case 1: /* 1 is a number */
+                if (stream->h264_info.ref_type == OT_VENC_BASE_IDR_SLICE ||
+                    stream->h264_info.ref_type == OT_VENC_BASE_P_SLICE_REF_BY_BASE ||
+                    stream->h264_info.ref_type == OT_VENC_BASE_P_SLICE_REF_BY_ENHANCE) {
+#ifndef __LITEOS__
+                    ret = sample_easyvenc_comm_venc_save_stream(stream_proc_info->file[index + cnt], stream);
+#else
+                    ret = sample_easyvenc_comm_venc_save_stream_phys_addr(stream_proc_info->file[index + cnt],
+                        &stream_buf_info[index], stream);
+#endif
+                }
+                break;
+            case 2: /* 2 is a number */
+#ifndef __LITEOS__
+                ret = sample_easyvenc_comm_venc_save_stream(stream_proc_info->file[index + cnt], stream);
+#else
+                ret = sample_easyvenc_comm_venc_save_stream_phys_addr(stream_proc_info->file[index + cnt],
+                    &stream_buf_info[index], stream);
+#endif
+                break;
+            default:
+                break;
+        }
+        if (ret != TD_SUCCESS) {
+            free(stream->pack);
+            stream->pack = TD_NULL;
+            sample_print("save stream failed!\n");
+            break;
+        }
+    }
+}
+
+static td_s32 sample_easyvenc_comm_get_stream_from_one_channl_svc_t(sample_comm_venc_stream_proc_info *stream_proc_info,
+    td_s32 index, ot_venc_stream_buf_info *stream_buf_info)
+{
+    td_s32 ret;
+    ot_venc_stream stream;
+    ot_venc_chn_status stat;
+
+    /* step 2.1 : query how many packs in one-frame stream. */
+    if (memset_s(&stream, sizeof(stream), 0, sizeof(stream)) != EOK) {
+        printf("call memset_s error\n");
+    }
+    ret = ss_mpi_venc_query_status(index, &stat);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_query chn[%d] failed with %#x!\n", index, ret);
+        return SAMPLE_RETURN_BREAK;
+    }
+
+    if (stat.cur_packs == 0) {
+        sample_print("NOTE: current  frame is TD_NULL!\n");
+        return SAMPLE_RETURN_CONTINUE;
+    }
+    /* step 2.3 : malloc corresponding number of pack nodes. */
+    stream.pack = (ot_venc_pack *)malloc(sizeof(ot_venc_pack) * stat.cur_packs);
+    if (stream.pack == TD_NULL) {
+        sample_print("malloc stream pack failed!\n");
+        return SAMPLE_RETURN_BREAK;
+    }
+    /* step 2.4 : call mpi to get one-frame stream */
+    stream.pack_cnt = stat.cur_packs;
+    ret = ss_mpi_venc_get_stream(index, &stream, TD_TRUE);
+    if (ret != TD_SUCCESS) {
+        free(stream.pack);
+        stream.pack = TD_NULL;
+        sample_print("ss_mpi_venc_get_stream failed with %#x!\n", ret);
+        return SAMPLE_RETURN_BREAK;
+    }
+    /* step 2.5 : save frame to file */
+    sample_easyvenc_comm_save_frame_to_file_svc_t(index, stream_proc_info, &stream, stream_buf_info);
+
+    /* step 2.6 : release stream */
+    ret = ss_mpi_venc_release_stream(index, &stream);
+    if (ret != TD_SUCCESS) {
+        free(stream.pack);
+        stream.pack = TD_NULL;
+        return SAMPLE_RETURN_BREAK;
+    }
+    /* step 2.7 : free pack nodes */
+    free(stream.pack);
+    stream.pack = TD_NULL;
+
+    return TD_SUCCESS;
+}
+
+static td_void sample_easyvenc_comm_fd_isset_svc_t(sample_comm_venc_stream_proc_info *stream_proc_info, fd_set *read_fds,
+    ot_venc_stream_buf_info *stream_buf_info, td_s32 venc_max_chn)
+{
+    td_s32 i, ret;
+    ot_unused(venc_max_chn);
+
+    for (i = 0; i < stream_proc_info->chn_total; i++) {
+        if (FD_ISSET(stream_proc_info->venc_fd[i], read_fds)) {
+            ret = sample_easyvenc_comm_get_stream_from_one_channl_svc_t(stream_proc_info, i, stream_buf_info);
+            if (ret == SAMPLE_RETURN_CONTINUE) {
+                continue;
+            } else if (ret == SAMPLE_RETURN_BREAK) {
+                break;
+            }
+        }
+    }
+}
+
+/* get svc_t stream from h264 channels and save them */
+td_void *sample_easyvenc_comm_venc_get_venc_stream_proc_svc_t(td_void *p)
+{
+    td_s32 i, ret;
+    td_void* res = TD_NULL;
+    sample_venc_getstream_para *para = (sample_venc_getstream_para *)p;
+    struct timeval timeout_val;
+    fd_set read_fds;
+    ot_venc_stream_buf_info stream_buf_info[OT_VENC_MAX_CHN_NUM];
+    sample_comm_venc_stream_proc_info *stream_proc_info = malloc(sizeof(sample_comm_venc_stream_proc_info));
+
+    if (stream_proc_info == TD_NULL || memset_s(stream_proc_info, sizeof(sample_comm_venc_stream_proc_info), 0,
+        sizeof(sample_comm_venc_stream_proc_info)) != EOK) {
+        res = (td_void *)TD_FAILURE;
+        goto FREE;
+    }
+
+    stream_proc_info->chn_total = para->cnt;
+
+    ret = sample_easyvenc_comm_set_name_save_stream_svc_t(stream_proc_info, stream_buf_info, OT_VENC_MAX_CHN_NUM);
+    if (ret == SAMPLE_RETURN_NULL) {
+        goto CLOSE_FILE;
+    } else if (ret == SAMPLE_RETURN_FAILURE) {
+        res = (td_void *)TD_FAILURE;
+        goto CLOSE_FILE;
+    }
+
+    /* step 2:  start to get streams of each channel. */
+    while (para->thread_start == TD_TRUE) {
+        FD_ZERO(&read_fds);
+        for (i = 0; i < stream_proc_info->chn_total; i++) {
+            FD_SET(stream_proc_info->venc_fd[i], &read_fds);
+        }
+        timeout_val.tv_sec = 2; /* 2 is a number */
+        timeout_val.tv_usec = 0;
+        ret = select(stream_proc_info->maxfd + 1, &read_fds, TD_NULL, TD_NULL, &timeout_val);
+        if (ret < 0) {
+            sample_print("select failed!\n");
+            break;
+        } else if (ret == 0) {
+            sample_print("get venc stream time out, exit thread\n");
+            continue;
+        } else {
+            sample_easyvenc_comm_fd_isset_svc_t(stream_proc_info, &read_fds, stream_buf_info, OT_VENC_MAX_CHN_NUM);
+        }
+    }
+
+CLOSE_FILE:
+    sample_easyvenc_comm_close_save_file_svc(stream_proc_info);
+FREE:
+    if (stream_proc_info != TD_NULL) {
+        free(stream_proc_info);
+    }
+
+    return res;
+}
+
+/* start get venc stream process thread */
+td_s32 sample_easyvenc_comm_venc_start_get_stream(ot_venc_chn *venc_chn, td_s32 cnt)
+{
+    td_s32 i, ret;
+    td_s32 wait_times = WAIT_GET_STREAM_THREAD_START_TIMES;
+
+    g_para.thread_start = TD_TRUE;
+    g_para.cnt = cnt;
+    if (cnt >= OT_VENC_MAX_CHN_NUM) {
+        sample_print("input count invalid\n");
+        return TD_FAILURE;
+    }
+    for (i = 0; (i < cnt) && (i < OT_VENC_MAX_CHN_NUM); i++) {
+        g_para.venc_chn[i] = venc_chn[i];
+    }
+
+    ret = pthread_create(&g_venc_pid, 0, sample_easyvenc_comm_venc_get_venc_stream_proc, (td_void *)&g_para);
+    if (ret < 0) {
+        sample_print("create threa failed !!! ret %d\n", ret);
+        return TD_FAILURE;
+    }
+
+    while (g_para.thread_start && wait_times-- > 0) {
+        usleep(WAIT_GET_STREAM_THREAD_START_SLEEP);
+        if (!g_para.thread_start) {
+            sample_print("start thread failed !!!\n");
+            pthread_join(g_venc_pid, 0);
+            return TD_FAILURE;
+        }
+    }
+
+    return ret;
+}
+/* stop get venc stream process. */
+td_s32 sample_easyvenc_comm_venc_stop_get_stream(td_s32 chn_num)
+{
+    td_s32 i;
+    if (g_para.thread_start == TD_TRUE) {
+        g_para.thread_start = TD_FALSE;
+        pthread_join(g_venc_pid, 0);
+    }
+
+    for (i = 0; i < chn_num; i++) {
+        if (ss_mpi_venc_stop_chn(i) != TD_SUCCESS) {
+            sample_print("chn %d ss_mpi_venc_stop_recv_pic failed!\n", i);
+            return TD_FAILURE;
+        }
+    }
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+
+	videostreaming = TD_FALSE;
+////////////////////////////////////// GB28281_RTP ==1 /////////////////////////////
+
+    return TD_SUCCESS;
+}
+
+
+/******************************copy from sample_comm_venc.c*****************************************/
+#endif
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include<stdbool.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <poll.h>
+#include <sys/time.h>
+#include <sys/select.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <pthread.h>
+#include <math.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <limits.h>
+#include "test-venc.h"
+#include "sample_ipc.h"
+#include "securec.h"
+#include "ot_defines.h"
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include "RtpSendPs.h"
+#define BIG_STREAM_SIZE PIC_720P
+#define SMALL_STREAM_SIZE PIC_720P
+
+#define VI_VB_YUV_CNT 4
+#define VPSS_VB_YUV_CNT 6
+
+#define ENTER_ASCII 10
+
+#define VB_MAX_NUM 10
+
+#define TYPE_NUM_MAX 3
+#define CHN_NUM_MAX 2
+#define GRP_NUM_MAX 2
+#define SVAC3_CHN_NUM_MAX 1
+#define MAX_WATERMARK_LEN 128
+#define VENC_CHN_ID 0
+#define VPSS_CHN_0      0
+#define VPSS_CHN_1      1
+#define VPSS_GRP        0
+#define VPSS_CHN_NUM    2
+#define DEFAULT_WAIT_TIME   20000
+
+typedef struct {
+    ot_size max_size;
+    ot_pixel_format pixel_format;
+    ot_size in_size;
+    ot_size output_size[OT_VPSS_MAX_PHYS_CHN_NUM];
+    ot_compress_mode compress_mode[OT_VPSS_MAX_PHYS_CHN_NUM];
+    td_bool enable[OT_VPSS_MAX_PHYS_CHN_NUM];
+    ot_fmu_mode fmu_mode[OT_VPSS_MAX_PHYS_CHN_NUM];
+} sample_venc_vpss_chn_attr;
+
+typedef struct {
+    td_u32 valid_num;
+    td_u64 blk_size[OT_VB_MAX_COMMON_POOLS];
+    td_u32 blk_cnt[OT_VB_MAX_COMMON_POOLS];
+    td_u32 supplement_config;
+} sample_venc_vb_attr;
+
+typedef struct {
+    ot_vpss_chn vpss_chn[CHN_NUM_MAX];
+    ot_venc_chn venc_chn[CHN_NUM_MAX];
+} sample_venc_vpss_chn;
+
+typedef struct {
+    td_s32 venc_chn_num;
+    ot_size enc_size[CHN_NUM_MAX];
+    td_s32 vpss_chn_depth;
+} sample_venc_param;
+
+
+
+static td_s32 sample_venc_msg_proc_vb_pool_share(td_s32 pid)
+{
+    td_u32 i;
+    ot_vb_common_pools_id pools_id = {0};
+
+    if (ss_mpi_vb_get_common_pool_id(&pools_id) != TD_SUCCESS) {
+        sample_print("get common pool_id failed!\n");
+        return TD_FAILURE;
+    }
+    for (i = 0; i < pools_id.pool_cnt; ++i) {
+        if (ss_mpi_vb_pool_share(pools_id.pool[i], pid) != TD_SUCCESS) {
+            sample_print("vb pool share failed!\n");
+            return TD_FAILURE;
+        }
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_void sample_venc_msg_proc_vb_pool_unshare(td_s32 pid)
+{
+    td_u32 i;
+    ot_vb_common_pools_id pools_id = {0};
+
+    if (ss_mpi_vb_get_common_pool_id(&pools_id) == TD_SUCCESS) {
+        for (i = 0; i < pools_id.pool_cnt; ++i) {
+            ss_mpi_vb_pool_unshare(pools_id.pool[i], pid);
+        }
+    }
+}
+
+static td_s32 sample_venc_ipc_msg_proc(const sample_ipc_msg_req_buf *msg_req_buf,
+    td_bool *is_need_fb, sample_ipc_msg_res_buf *msg_res_buf)
+{
+    td_s32 ret;
+
+    if (msg_req_buf == TD_NULL || is_need_fb == TD_NULL) {
+        return TD_FAILURE;
+    }
+
+    /* need feedback default */
+    *is_need_fb = TD_TRUE;
+
+    switch ((sample_msg_type)msg_req_buf->msg_type) {
+        case SAMPLE_MSG_TYPE_VB_POOL_SHARE_REQ: {
+            if (msg_res_buf == TD_NULL) {
+                return TD_FAILURE;
+            }
+            ret = sample_venc_msg_proc_vb_pool_share(msg_req_buf->msg_data.pid);
+            msg_res_buf->msg_type = SAMPLE_MSG_TYPE_VB_POOL_SHARE_RES;
+            msg_res_buf->msg_data.is_req_success = (ret == TD_SUCCESS) ? TD_TRUE : TD_FALSE;
+            break;
+        }
+        case SAMPLE_MSG_TYPE_VB_POOL_UNSHARE_REQ: {
+            if (msg_res_buf == TD_NULL) {
+                return TD_FAILURE;
+            }
+            sample_venc_msg_proc_vb_pool_unshare(msg_req_buf->msg_data.pid);
+            msg_res_buf->msg_type = SAMPLE_MSG_TYPE_VB_POOL_UNSHARE_RES;
+            msg_res_buf->msg_data.is_req_success = TD_TRUE;
+            break;
+        }
+        default: {
+            printf("unsupported msg type(%ld)!\n", msg_req_buf->msg_type);
+            return TD_FAILURE;
+        }
+    }
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_venc_get_enc_size(hi_pic_size *pic_size, sample_venc_param *enc_param)
+{
+    td_s32 i;
+    td_s32 ret;
+
+    for (i = 0; i < enc_param->venc_chn_num && i < CHN_NUM_MAX; i++) {
+        ret = sample_comm_sys_get_pic_size(pic_size[i], &(enc_param->enc_size[i]));
+        if (ret != TD_SUCCESS) {
+            sample_print("sample_comm_sys_get_pic_size failed!\n");
+            return ret;
+        }
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_void sample_set_venc_vpss_chn(sample_venc_vpss_chn *venc_vpss_chn, td_s32 chn_num_max)
+{
+    td_s32 i;
+    ot_unused(chn_num_max);
+
+    for (i = 0; i < CHN_NUM_MAX; i++) {
+        venc_vpss_chn->vpss_chn[i] = i;
+        venc_vpss_chn->venc_chn[i] = i;
+    }
+}
+static td_s32 sample_venc_vi_init(sample_vi_cfg *vi_cfg)
+{
+    td_s32 ret;
+
+    ret = sample_comm_vi_start_vi(vi_cfg);
+    if (ret != TD_SUCCESS) {
+        sample_print("sample_comm_vi_start_vi failed: 0x%x\n", ret);
+        return ret;
+    }
+
+    return TD_SUCCESS;
+}
+static td_void sample_venc_vi_deinit(sample_vi_cfg *vi_cfg)
+{
+    sample_comm_vi_stop_vi(vi_cfg);
+}
+static td_void sample_venc_online_wrap_get_default_sys_cfg(sampe_sys_cfg *sys_cfg)
+{
+    sys_cfg->route_num = 1;
+    sys_cfg->mode_type = OT_VI_ONLINE_VPSS_ONLINE;
+    sys_cfg->vpss_wrap_en = TD_TRUE;
+}
+td_void sample_venc_online_wrap_get_default_vpss_cfg(sample_sns_type sns_type, sample_vpss_cfg *vpss_cfg,
+    sample_venc_param *enc_param)
+{
+    ot_vpss_chn chn;
+    ot_size in_size;
+    td_u32 max_width;
+    td_u32 max_height;
+
+    sample_comm_vi_get_size_by_sns_type(sns_type, &in_size);
+    sample_comm_vpss_get_default_grp_attr(&vpss_cfg->grp_attr);
+    sample_comm_vpss_get_default_3dnr_attr(&vpss_cfg->nr_attr);
+    vpss_cfg->vpss_grp = 0;
+    max_width = in_size.width;
+    max_height = in_size.height;
+
+    for (chn = 0; chn < enc_param->venc_chn_num && OT_VPSS_MAX_PHYS_CHN_NUM; chn++) {
+        vpss_cfg->chn_en[chn] = TD_TRUE;
+        sample_comm_vpss_get_default_chn_attr(&vpss_cfg->chn_attr[chn]);
+        if (chn > OT_VPSS_CHN1) {
+            vpss_cfg->chn_attr[chn].compress_mode = OT_COMPRESS_MODE_NONE;
+        }
+        vpss_cfg->chn_attr[chn].width  = enc_param->enc_size[chn].width;
+        vpss_cfg->chn_attr[chn].height = enc_param->enc_size[chn].height;
+        vpss_cfg->chn_attr[chn].depth = enc_param->vpss_chn_depth;
+
+        max_width = MAX2(max_width, enc_param->enc_size[chn].width);
+        max_height = MAX2(max_height, enc_param->enc_size[chn].height);
+    }
+    vpss_cfg->chn_attr[OT_VPSS_CHN0].compress_mode = OT_COMPRESS_MODE_SEG_COMPACT;
+    vpss_cfg->grp_attr.max_width  = max_width;
+    vpss_cfg->grp_attr.max_height = max_height;
+    vpss_cfg->wrap_attr[0].enable = TD_TRUE;
+}
+static td_void sample_venc_online_wrap_get_default_vb_cfg(ot_vb_cfg *vb_cfg, sample_venc_param *enc_param,
+    td_u32 wrap_size)
+{
+    td_s32 i;
+    ot_vb_calc_cfg calc_cfg;
+    ot_pic_buf_attr buf_attr;
+
+    (td_void)memset_s(vb_cfg, sizeof(ot_vb_cfg), 0, sizeof(ot_vb_cfg));
+    vb_cfg->max_pool_cnt = 128; /* 128 blks */
+
+    for (i = 1; i < enc_param->venc_chn_num && CHN_NUM_MAX; i++) {
+        buf_attr.width = enc_param->enc_size[i].width;
+        buf_attr.height = enc_param->enc_size[i].height;
+        buf_attr.align = OT_DEFAULT_ALIGN;
+        buf_attr.bit_width = OT_DATA_BIT_WIDTH_8;
+        buf_attr.pixel_format = OT_PIXEL_FORMAT_YVU_SEMIPLANAR_420;
+        buf_attr.compress_mode = OT_COMPRESS_MODE_NONE;
+        buf_attr.video_format = OT_VIDEO_FORMAT_LINEAR;
+        ot_common_get_pic_buf_cfg(&buf_attr, &calc_cfg);
+
+        vb_cfg->common_pool[i].blk_size = calc_cfg.vb_size;
+        vb_cfg->common_pool[i].blk_cnt = 3; /* 3 blk_cnt */
+    }
+
+    vb_cfg->common_pool[i].blk_cnt = 1;
+    vb_cfg->common_pool[i].blk_size = wrap_size;
+}
+static td_s32 sample_venc_online_wrap_sys_init(sample_venc_param *enc_param, sampe_sys_cfg *sys_cfg)
+{
+    td_s32 ret;
+    ot_vb_cfg vb_cfg = {0};
+    td_u32 supplement_config = OT_VB_SUPPLEMENT_JPEG_MASK | OT_VB_SUPPLEMENT_BNR_MOT_MASK;
+
+    sample_venc_online_wrap_get_default_vb_cfg(&vb_cfg, enc_param, sys_cfg->vpss_wrap_size);
+
+    if (supplement_config == 0) {
+        ret = sample_comm_sys_vb_init(&vb_cfg);
+    } else {
+        ret = sample_comm_sys_init_with_vb_supplement(&vb_cfg, supplement_config);
+    }
+
+    if (ret != TD_SUCCESS) {
+        sample_print("sample_venc_sys_init failed!\n");
+    }
+
+    if (sample_comm_vi_set_vi_vpss_mode(sys_cfg->mode_type, OT_VI_AIISP_MODE_DEFAULT) != TD_SUCCESS) {
+        goto sys_exit;
+    }
+
+    return TD_SUCCESS;
+sys_exit:
+    sample_comm_sys_exit();
+    return TD_FAILURE;
+}
+static td_void sample_venc_vpss_get_wrap_cfg(sample_sns_type sns_type, sampe_sys_cfg *sys_cfg,
+    sample_vpss_cfg *vpss_cfg)
+{
+    td_u32 full_lines_std;
+    if (sys_cfg->vpss_wrap_en) {
+        if (sns_type == SC4336P_MIPI_4M_30FPS_10BIT || sns_type == OS04D10_MIPI_4M_30FPS_10BIT ||
+            sns_type == GC4023_MIPI_4M_30FPS_10BIT || sns_type == SC431HAI_MIPI_4M_30FPS_10BIT ||
+            sns_type == SC431HAI_MIPI_4M_30FPS_10BIT_WDR2TO1) {
+            full_lines_std = 1500; /* full_lines_std: 1500 */
+        } else if (sns_type == SC450AI_MIPI_4M_30FPS_10BIT || sns_type == SC450AI_MIPI_4M_30FPS_10BIT_WDR2TO1) {
+            full_lines_std = 1585; /* full_lines_std: 1585 */
+        } else if (sns_type == SC500AI_MIPI_5M_30FPS_10BIT || sns_type == SC500AI_MIPI_5M_30FPS_10BIT_WDR2TO1) {
+            full_lines_std = 1700; /* full_lines_std: 1700 */
+        } else {
+            sys_cfg->vpss_wrap_en = TD_FALSE;
+            vpss_cfg->wrap_attr[0].enable = TD_FALSE;
+            return;
+        }
+        (td_void)sample_comm_vpss_get_wrap_cfg(vpss_cfg->chn_attr, sys_cfg->mode_type, full_lines_std,
+            &vpss_cfg->wrap_attr[0]);
+
+        sys_cfg->vpss_wrap_size = vpss_cfg->wrap_attr[0].buf_size;
+    }
+}
+static td_s32 sample_venc_online_wrap_start_vpss(ot_vpss_grp grp, sample_vpss_cfg *vpss_cfg)
+{
+    td_s32 ret;
+    ot_frame_interrupt_attr frame_interrupt_attr = {0};
+    sample_vpss_chn_attr vpss_chn_attr = {0};
+
+    frame_interrupt_attr.interrupt_type = OT_FRAME_INTERRUPT_EARLY_END;
+    frame_interrupt_attr.early_line = vpss_cfg->grp_attr.max_height / 2; /* 2 half */
+    ret = ss_mpi_vpss_set_grp_frame_interrupt_attr(0, &frame_interrupt_attr);
+    if (ret != TD_SUCCESS) {
+        printf("ss_mpi_vpss_set_grp_frame_interrupt_attr failed!\n");
+        return ret;
+    }
+
+    (td_void)memcpy_s(&vpss_chn_attr.chn_attr[0], sizeof(ot_vpss_chn_attr) * OT_VPSS_MAX_PHYS_CHN_NUM,
+        vpss_cfg->chn_attr, sizeof(ot_vpss_chn_attr) * OT_VPSS_MAX_PHYS_CHN_NUM);
+    (td_void)memcpy_s(vpss_chn_attr.chn_enable, sizeof(vpss_chn_attr.chn_enable),
+        vpss_cfg->chn_en, sizeof(vpss_chn_attr.chn_enable));
+    (td_void)memcpy_s(&vpss_chn_attr.wrap_attr[0], sizeof(ot_vpss_chn_buf_wrap_attr) * OT_VPSS_MAX_PHYS_CHN_NUM,
+        vpss_cfg->wrap_attr, sizeof(ot_vpss_chn_buf_wrap_attr) * OT_VPSS_MAX_PHYS_CHN_NUM);
+    vpss_chn_attr.chn_array_size = OT_VPSS_MAX_PHYS_CHN_NUM;
+    ret = sample_common_vpss_start(grp, &vpss_cfg->grp_attr, &vpss_chn_attr);
+    if (ret != TD_SUCCESS) {
+        return ret;
+    }
+
+    if (vpss_cfg->chn_en[1]) {
+        const ot_low_delay_info low_delay_info = { TD_TRUE, 200, TD_FALSE }; /* 200: lowdelay line */
+        if (ss_mpi_vpss_set_chn_low_delay(grp, 1, &low_delay_info) != TD_SUCCESS) {
+            goto stop_vpss;
+        }
+    }
+
+    return TD_SUCCESS;
+
+stop_vpss:
+    sample_common_vpss_stop(grp, vpss_cfg->chn_en, OT_VPSS_MAX_PHYS_CHN_NUM);
+    return TD_FAILURE;
+}
+static td_void sample_venc_online_wrap_stop_vpss(ot_vpss_grp grp, sample_vpss_cfg *vpss_cfg)
+{
+    sample_common_vpss_stop(grp, vpss_cfg->chn_en, OT_VPSS_MAX_PHYS_CHN_NUM);
+}
+static td_s32 sample_venc_online_wrap_start_sys_vi_vpss(sample_sns_type sns_type, sample_vi_cfg *vi_cfg,
+    sample_vpss_cfg *vpss_cfg, sample_venc_param *enc_param)
+{
+    td_s32 ret;
+    sampe_sys_cfg sys_cfg = {0};
+    ot_vi_pipe vi_pipe = 0;
+    ot_vpss_grp vpss_grp = 0;
+
+    /* *****************************************
+      step 0: related parameter ready
+    ***************************************** */
+    sample_venc_online_wrap_get_default_sys_cfg(&sys_cfg);
+    sample_comm_vi_get_default_vi_cfg(sns_type, vi_cfg);
+    sample_venc_online_wrap_get_default_vpss_cfg(sns_type, vpss_cfg, enc_param);
+    sample_venc_vpss_get_wrap_cfg(sns_type, &sys_cfg, vpss_cfg);
+
+    /* *****************************************
+      step 1: init sys alloc common vb
+    ***************************************** */
+    if ((ret = sample_venc_online_wrap_sys_init(enc_param, &sys_cfg)) != TD_SUCCESS) {
+        sample_print("Init SYS err for %#x!\n", ret);
+        return ret;
+    }
+
+    if ((ret = sample_venc_vi_init(vi_cfg)) != TD_SUCCESS) {
+        sample_print("Init VI err for %#x!\n", ret);
+        goto EXIT_SYS_STOP;
+    }
+
+    if ((ret = sample_venc_online_wrap_start_vpss(vpss_grp, vpss_cfg)) != TD_SUCCESS) {
+        sample_print("Init VPSS err for %#x!\n", ret);
+        goto EXIT_VI_STOP;
+    }
+
+    if ((ret = sample_comm_vi_bind_vpss(vi_pipe, 0, vpss_grp, 0)) != TD_SUCCESS) {
+        sample_print("VI Bind VPSS err for %#x!\n", ret);
+        goto EXIT_VPSS_STOP;
+    }
+
+    return TD_SUCCESS;
+
+    sample_comm_vi_un_bind_vpss(vi_pipe, 0, vpss_grp, 0);
+EXIT_VPSS_STOP:
+    sample_venc_online_wrap_stop_vpss(vpss_grp, vpss_cfg);
+EXIT_VI_STOP:
+    sample_venc_vi_deinit(vi_cfg);
+EXIT_SYS_STOP:
+    sample_comm_sys_exit();
+
+    return ret;
+}
+
+static td_s32 sample_venc_set_video_param(ot_size *enc_size, sample_comm_venc_chn_param *chn_param, td_s32 chn_num_max,
+    ot_venc_gop_attr gop_attr, td_bool qp_map)
+{
+    td_bool share_buf_en = TD_TRUE;
+    sample_rc rc_mode = SAMPLE_RC_AVBR;//张军设置速率控制
+    td_u32 profile[CHN_NUM_MAX] = {0, 0};
+    ot_payload_type payload[4] = {OT_PT_H265, OT_PT_H264}; // 2 : payload num
+
+    // if (qp_map) {
+    //     rc_mode = SAMPLE_RC_QPMAP;
+    // } 
+
+    if (chn_num_max < 2) { /* 2: chn_param array len */
+        sample_print("chn_num_max  %d not enough! should > 1\n", chn_num_max);
+        return TD_FAILURE;
+    }
+
+    /* encode h.265 */
+    chn_param[0].frame_rate = 25; /* 30: is a number */
+    chn_param[0].gop = 60; /* 60: is a number */
+    chn_param[0].stats_time = 2; /* 2: is a number */
+    chn_param[0].gop_attr = gop_attr;
+    chn_param[0].type = payload[0];
+    chn_param[0].size = sample_comm_sys_get_pic_enum(&enc_size[0]);
+    chn_param[0].rc_mode = rc_mode;
+    chn_param[0].profile = profile[0];
+    chn_param[0].is_rcn_ref_share_buf = share_buf_en;
+
+    /* encode h.264 */
+    chn_param[1].frame_rate = 25; /* 30: is a number */
+    chn_param[1].gop = 60; /* 60: is a number */
+    chn_param[1].stats_time = 2; /* 2: is a number */
+    chn_param[1].gop_attr = gop_attr;
+    chn_param[1].type = payload[1];
+    chn_param[1].size = sample_comm_sys_get_pic_enum(&enc_size[1]);
+    chn_param[1].rc_mode = rc_mode;
+    chn_param[1].profile = profile[1];
+    chn_param[1].is_rcn_ref_share_buf = share_buf_en;
+    return TD_SUCCESS;
+}
+
+static td_void sample_venc_online_wrap_stop_sys_vi_vpss(sample_vi_cfg *vi_cfg, sample_vpss_cfg *vpss_cfg)
+{
+    ot_vi_pipe vi_pipe = 0;
+    ot_vpss_grp vpss_grp = 0;
+
+    sample_comm_vi_un_bind_vpss(vi_pipe, 0, vpss_grp, 0);
+    sample_venc_online_wrap_stop_vpss(vpss_grp, vpss_cfg);
+    sample_venc_vi_deinit(vi_cfg);
+    sample_comm_sys_exit();
+}
+static td_void sample_venc_exit_process()
+{
+    // printf("please press twice ENTER to exit this sample\n");
+    // (td_void)getchar();
+
+    // if (g_sample_venc_exit != TD_TRUE) {
+    //     (td_void)getchar();
+    // }
+    sample_easyvenc_comm_venc_stop_get_stream(CHN_NUM_MAX);
+}
+static td_void sample_venc_unbind_vpss_stop(ot_vpss_grp vpss_grp, const sample_venc_vpss_chn *venc_vpss_chn)
+{
+    td_s32 i;
+
+    for (i = 0; i < CHN_NUM_MAX; i++) {
+        sample_comm_vpss_un_bind_venc(vpss_grp, venc_vpss_chn->vpss_chn[i], venc_vpss_chn->venc_chn[i]);
+        sample_comm_venc_stop(venc_vpss_chn->venc_chn[i]);
+    }
+}
+static td_s32 sample_venc_normal_start_encode(ot_size *enc_size, ot_vpss_grp vpss_grp,
+    sample_venc_vpss_chn *venc_vpss_chn)
+{
+    td_s32 ret;
+    ot_venc_gop_mode gop_mode = 0;//0 normal 1 dual 2 smart张军
+    ot_venc_gop_attr gop_attr;
+    sample_comm_venc_chn_param chn_param[CHN_NUM_MAX] = {0};
+
+    
+    if ((ret = sample_comm_venc_get_gop_attr(gop_mode, &gop_attr)) != TD_SUCCESS) {
+        sample_print("Venc Get GopAttr for %#x!\n", ret);
+        return ret;
+    }
+
+    if ((ret = sample_venc_set_video_param(enc_size, chn_param, CHN_NUM_MAX, gop_attr, TD_FALSE)) != TD_SUCCESS) {
+        return ret;
+    }
+
+    if ((ret = sample_comm_venc_mini_buf_en(chn_param, CHN_NUM_MAX)) != TD_SUCCESS) {
+        return ret;
+    }
+
+    /* encode h.265 */
+    if ((ret = sample_comm_venc_start(venc_vpss_chn->venc_chn[0], &(chn_param[0]))) != TD_SUCCESS) {
+        sample_print("Venc Start failed for %#x!\n", ret);
+        return ret;
+    }
+
+    if (sample_comm_vpss_bind_venc(vpss_grp, venc_vpss_chn->vpss_chn[0], venc_vpss_chn->venc_chn[0]) != TD_SUCCESS) {
+        sample_print("sample_comm_vpss_bind_venc failed!\n");
+        goto EXIT_VENC_H265_STOP;
+    }
+
+    /* encode h.264 */
+    if ((ret = sample_comm_venc_start(venc_vpss_chn->venc_chn[1], &(chn_param[1]))) != TD_SUCCESS) {
+        sample_print("Venc Start failed for %#x!\n", ret);
+        goto EXIT_VENC_H265_UnBind;
+    }
+
+    if (sample_comm_vpss_bind_venc(vpss_grp, venc_vpss_chn->vpss_chn[1], venc_vpss_chn->venc_chn[1]) != TD_SUCCESS) {
+        sample_print("sample_comm_vpss_bind_venc failed!\n");
+        goto EXIT_VENC_H264_STOP;
+    }
+
+    /* *****************************************
+     stream save process
+    ***************************************** */
+    if ((ret = sample_easyvenc_comm_venc_start_get_stream(venc_vpss_chn->venc_chn, CHN_NUM_MAX)) != TD_SUCCESS) {
+        sample_print("Start Venc failed!\n");
+        goto EXIT_VENC_H264_UnBind;
+    }
+
+    return TD_SUCCESS;
+
+EXIT_VENC_H264_UnBind:
+    sample_comm_vpss_un_bind_venc(vpss_grp, venc_vpss_chn->vpss_chn[1], venc_vpss_chn->venc_chn[1]);
+EXIT_VENC_H264_STOP:
+    sample_comm_venc_stop(venc_vpss_chn->venc_chn[1]);
+EXIT_VENC_H265_UnBind:
+    sample_comm_vpss_un_bind_venc(vpss_grp, venc_vpss_chn->vpss_chn[0], venc_vpss_chn->venc_chn[0]);
+EXIT_VENC_H265_STOP:
+    sample_comm_venc_stop(venc_vpss_chn->venc_chn[0]);
+
+    return TD_FAILURE;
+}
+
+ot_vpss_grp vpss_grp = 0;
+sample_venc_vpss_chn venc_vpss_chn = {0};
+sample_vi_cfg vi_cfg = {0};
+sample_vpss_cfg vpss_cfg = {0};
+td_s32 retry_times = 0;
+
+td_s32 GB28281_venc_start()
+{
+    td_s32 ret;
+    retry_times = 0;
+
+    sample_sns_type sns_type = 0;
+
+    
+
+    sample_venc_param enc_param = {0};
+    hi_pic_size pic_size[CHN_NUM_MAX] = {0};
+
+    /* *****************************************
+      step 0: related parameter ready
+    ***************************************** */
+    sns_type = SENSOR0_TYPE;
+    enc_param.venc_chn_num = CHN_NUM_MAX;
+    pic_size[0] = BIG_STREAM_SIZE;
+    pic_size[1] = SMALL_STREAM_SIZE;
+    sample_venc_get_enc_size(pic_size, &enc_param);
+    sample_set_venc_vpss_chn(&venc_vpss_chn, enc_param.venc_chn_num);
+    /* *****************************************
+      step 1: init sys alloc common vb
+    ***************************************** */
+retry:
+    if ((ret = sample_venc_online_wrap_start_sys_vi_vpss(sns_type, &vi_cfg, &vpss_cfg, &enc_param)) != TD_SUCCESS) {
+        if(retry_times == 0)
+        {
+            sample_venc_online_wrap_stop_sys_vi_vpss(&vi_cfg, &vpss_cfg);
+            retry_times ++;
+            goto retry;
+        }
+        return ret;
+    }
+
+    if ((ret = sample_venc_normal_start_encode(&enc_param.enc_size[0], vpss_grp, &venc_vpss_chn)) != TD_SUCCESS) {
+        //  goto EXIT_SYS_VI_VPSS;
+        sample_venc_online_wrap_stop_sys_vi_vpss(&vi_cfg, &vpss_cfg);
+    }
+
+    return ret;       
+}
+
+
+td_s32 GB28281_venc_stop()
+{
+    sample_venc_exit_process();
+    sample_venc_unbind_vpss_stop(vpss_grp, &venc_vpss_chn);
+    sample_venc_online_wrap_stop_sys_vi_vpss(&vi_cfg, &vpss_cfg);
+    return 0;
+}

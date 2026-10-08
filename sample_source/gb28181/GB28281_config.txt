@@ -1,0 +1,1 @@
+default=TRUE#serverIp=192.168.1.103#serverPort=15060#serverSipId=34020000002000000001#serverSipRealm=3402000000#serverSipPass=12345678#serverSipTimeout=0#serverSipExpiry=3600#clientUa=hi3516cv610#clientIp=192.168.1.10#clientPort=5060#clientId=24000000000024000004#video_type=36#

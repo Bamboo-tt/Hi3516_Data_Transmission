@@ -1,0 +1,13 @@
+export PARAM_FILE := ../../../../Makefile.param
+include $(PARAM_FILE)
+
+COMMON_DIR:=$(PWD)/../../common
+AUDIO_ADP_DIR:=$(PWD)/../../audio/adp
+include ../../Makefile.param
+
+MPI_LIBS += $(HI_REL_LIB)/libhi_mpi_ive.a
+MPI_LIBS += $(HI_REL_LIB)/libhi_ivs_md.a
+#CFLAGS += -I$(PWD)/../../common
+CFLAGS += -I$(PWD)/../common
+CFLAGS += -fstack-protector-strong
+

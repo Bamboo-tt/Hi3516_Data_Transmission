@@ -1,0 +1,7 @@
+# Preserve existing source line endings; choose an explicit policy in a later change.
+* -text
+
+# New repository and learning documentation use LF across platforms.
+*.md text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
