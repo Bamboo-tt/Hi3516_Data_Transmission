@@ -7,7 +7,9 @@
 - [自定义 RTP 程序](hi3516firm/new_main2.c)：SC500AI 图像采集、H.265 编码与 RTP/UDP 发送。
 - [RTSP 示例](sample_source/rtsp_4m/sample_rtsp.c)：媒体初始化、双通道 H.264 编码及 RTSP 分发。
 
-详细说明从 [项目学习入口](docs/Hi3516CV610_项目学习/README.md) 开始；原有 [全局架构分析](docs/全局架构与技术剖析.md) 同时保留。
+详细说明从 [项目学习入口](docs/Hi3516CV610_项目学习/README.md) 开始，沿构建、初始化、逐帧处理、传输与退出连续阅读；[全局架构分析](docs/全局架构与技术剖析.md) 汇总模块关系、设计取舍和源码风险。
+
+维护本项目时先读 [AGENTS.md](AGENTS.md)。其中链接本项目的 [内容 skill](docs/_authoring/hi3516-project-storyline/SKILL.md) 和 [格式 skill](docs/_authoring/hi3516-chapter-format/SKILL.md)，用于保持说明与实际源码一致；两份 skill 保存于仓库，未安装到全局目录。
 
 ## Git 管理范围
 
